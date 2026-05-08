@@ -1,0 +1,8 @@
+.conda/
+openai_large_5m/
+__pycache__/
+*.pyc
+.codex/
+.agents/
+Miniforge3-Linux-x86_64.sh
+*.sh
