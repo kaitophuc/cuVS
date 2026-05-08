@@ -1,7 +1,7 @@
 import numpy as np
 from config import GROUND_TRUTH_BATCH_SIZE, GROUND_TRUTH_TOP_K, QUERY_LIMIT, DISPLAY_TOP_K
 
-def compute_exact_ground_truth(dataset, dataset_ids, queries, top_k = GROUND_TRUTH_TOP_K, query_limit = QUERY_LIMIT, batch_size = GROUND_TRUTH_BATCH_SIZE, print_progress=False):
+def compute_exact_ground_truth(dataset, dataset_ids, queries, top_k = GROUND_TRUTH_TOP_K, query_limit = QUERY_LIMIT, batch_size = GROUND_TRUTH_BATCH_SIZE):
     queries_subset = queries[:query_limit]
 
     gt_distances_batches = []
@@ -32,9 +32,6 @@ def compute_exact_ground_truth(dataset, dataset_ids, queries, top_k = GROUND_TRU
 
         gt_distances_batches.append(sorted_distances.astype(np.float32))
         gt_neighbors_batches.append(sorted_neighbors_ids.astype(np.int64))
-
-        if print_progress:
-            print(f"computed ground truth for queries {start} to {end - 1}")
 
     gt_distances = np.vstack(gt_distances_batches)
     gt_neighbors = np.vstack(gt_neighbors_batches)
