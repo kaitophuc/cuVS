@@ -1,9 +1,4 @@
-N_LISTS = 1024
-N_PROBES_SWEEP = [8, 16, 32, 64, 128]
-
-K = 10 # top-k neighbors to retrieve
-METRIC = "sqeuclidean"
-DISTRIBUTION_MODE = "sharded"
+from config import DISTRIBUTION_MODE, K, METRIC, N_LISTS, N_PROBES_SWEEP
 
 def describe_ivf_params(dataset, print_info=True):
     num_vectors = dataset.shape[0]

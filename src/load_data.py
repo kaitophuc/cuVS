@@ -1,19 +1,17 @@
 import numpy as np
 import pyarrow.parquet as pq
-
-TRAIN_PATH = "openai_large_5m/train-00-of-10.parquet"
-QUERY_PATH = "openai_large_5m/test.parquet"
+from config import EMBEDDING_COLUMN, ID_COLUMN, QUERY_PATH, TRAIN_PATH, VECTOR_DIM
 
 def load_parquet_vectors(path):
-    table = pq.read_table(path, columns=["id", "emb"])
+    table = pq.read_table(path, columns=[ID_COLUMN, EMBEDDING_COLUMN])
 
-    ids = np.asarray(table["id"].to_numpy(), dtype=np.int64)
+    ids = np.asarray(table[ID_COLUMN].to_numpy(), dtype=np.int64)
 
     num_rows = table.num_rows
 
-    emb_col = table["emb"].combine_chunks()
+    emb_col = table[EMBEDDING_COLUMN].combine_chunks()
     values = emb_col.values.to_numpy(zero_copy_only=False)
-    embeddings = values.reshape(num_rows, 1536).astype(np.float32)
+    embeddings = values.reshape(num_rows, VECTOR_DIM).astype(np.float32)
 
     return ids, embeddings
 

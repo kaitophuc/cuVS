@@ -1,4 +1,6 @@
-def calculate_recall_at_k(ivf_neighbors, gt_neighbors, k = 10):
+from config import DISPLAY_TOP_K, GROUND_TRUTH_BATCH_SIZE, GROUND_TRUTH_TOP_K, K, QUERY_LIMIT
+
+def calculate_recall_at_k(ivf_neighbors, gt_neighbors, k = K):
     num_queries = gt_neighbors.shape[0]
 
     ivf_top_k = ivf_neighbors[:num_queries, :k]
@@ -19,7 +21,7 @@ def calculate_recall_at_k(ivf_neighbors, gt_neighbors, k = 10):
     return recall_at_k, total_correct, total_possible
 
 def main():
-    from IVF_flat import K, N_PROBES_SWEEP, describe_ivf_params
+    from IVF_flat import N_PROBES_SWEEP, describe_ivf_params
     from computeL2 import compute_exact_ground_truth
     from load_data import load_default_data
     from multiGPU_IVF_FLat import (
@@ -42,18 +44,18 @@ def main():
         dataset=dataset,
         dataset_ids=dataset_ids,
         queries=queries,
-        top_k=100,
-        query_limit=100,
-        batch_size=10,
+        top_k=GROUND_TRUTH_TOP_K,
+        query_limit=QUERY_LIMIT,
+        batch_size=GROUND_TRUTH_BATCH_SIZE,
         print_progress=True,
     )
 
     print("Ground truth distances shape:", gt_distances.shape)
     print("Ground truth neighbors shape:", gt_neighbors.shape)
-    print("First query top 10 neighbors:", gt_neighbors[0, :10])
-    print("First query top 10 distances:", gt_distances[0, :10])
+    print("First query top 10 neighbors:", gt_neighbors[0, :DISPLAY_TOP_K])
+    print("First query top 10 distances:", gt_distances[0, :DISPLAY_TOP_K])
 
-    recall_at_10, total_correct, total_possible = calculate_recall_at_k(neighbors, gt_neighbors, k=10)
+    recall_at_10, total_correct, total_possible = calculate_recall_at_k(neighbors, gt_neighbors, k=K)
 
     print(f"\nRecall@10: {recall_at_10:.4f} ({total_correct} out of {total_possible} correct neighbors)")
 

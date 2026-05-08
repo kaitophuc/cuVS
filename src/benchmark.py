@@ -3,6 +3,14 @@ from multiGPU_IVF_FLat import create_index_params, create_search_params
 from computeL2 import compute_exact_ground_truth
 from calculateRecall import calculate_recall_at_k
 from IVF_flat import K, N_PROBES_SWEEP
+from config import (
+    BENCHMARK_QUERY_COUNT,
+    DISPLAY_TOP_K,
+    GROUND_TRUTH_BATCH_SIZE,
+    GROUND_TRUTH_TOP_K,
+    MS_PER_SECOND,
+    QUERY_LIMIT,
+)
 
 import time
 from cuvs.neighbors.mg import ivf_flat
@@ -13,16 +21,16 @@ def run_benchmark():
         dataset=dataset,
         dataset_ids=dataset_ids,
         queries=queries,
-        top_k=100,
-        query_limit=100,
-        batch_size=10,
+        top_k=GROUND_TRUTH_TOP_K,
+        query_limit=QUERY_LIMIT,
+        batch_size=GROUND_TRUTH_BATCH_SIZE,
         print_progress=True,
     )
 
     index_params = create_index_params()
     search_params = create_search_params(N_PROBES_SWEEP[-1])
 
-    benchmark_queries = queries[:100]
+    benchmark_queries = queries[:BENCHMARK_QUERY_COUNT]
     num_queries = benchmark_queries.shape[0]
 
     print("\nRunning benchmark on IVF-Flat with multi-GPU search...")
@@ -48,17 +56,17 @@ def run_benchmark():
     print(f"IVF-Flat search completed in {search_time:.2f} seconds")
     print("Distances shape:", distances.shape)
     print("Neighbors shape:", neighbors.shape)
-    print("First query top 10 neighbors:", neighbors[0, :10])
-    print("First query top 10 distances:", distances[0, :10])
+    print("First query top 10 neighbors:", neighbors[0, :DISPLAY_TOP_K])
+    print("First query top 10 distances:", distances[0, :DISPLAY_TOP_K])
 
     #Compute speed numbers
     queries_per_second = num_queries / search_time
     print(f"Throughput: {queries_per_second:.2f} queries/second")
-    latency_per_query = search_time * 1000.0 / num_queries
+    latency_per_query = search_time * MS_PER_SECOND / num_queries
     print(f"Average latency per query: {latency_per_query:.2f} ms")
 
     #compute recall
-    recall_at_10, total_correct, total_possible = calculate_recall_at_k(neighbors, gt_neighbors[:num_queries], k=10)
+    recall_at_10, total_correct, total_possible = calculate_recall_at_k(neighbors, gt_neighbors[:num_queries], k=K)
     print(f"\nRecall@10: {recall_at_10:.4f} ({total_correct} out of {total_possible} correct neighbors)")
 
     print("\nBenchmark complete.")

@@ -1,5 +1,6 @@
 import time
 from IVF_flat import N_LISTS, N_PROBES_SWEEP, K, METRIC, DISTRIBUTION_MODE, describe_ivf_params
+from config import DISPLAY_TOP_K, MERGE_MODE, SEARCH_MODE
 from load_data import load_default_data
 from cuvs.neighbors.mg import ivf_flat
 
@@ -37,8 +38,8 @@ def build_ivf_flat_index(dataset, index_params, print_info=False):
 
 def create_search_params(
     n_probes,
-    search_mode="load_balancer",
-    merge_mode="merge_on_root_rank",
+    search_mode=SEARCH_MODE,
+    merge_mode=MERGE_MODE,
 ):
     return ivf_flat.SearchParams(
         n_probes=n_probes,
@@ -59,8 +60,8 @@ def search_ivf_flat(index, queries, search_params, k, print_info=False):
         print("Search completed.")
         print("Distances shape:", distances.shape)
         print("Neighbors shape:", neighbors.shape)
-        print("First query top 10 neighbors:", neighbors[0, :10])
-        print("First query top 10 distances:", distances[0, :10])
+        print("First query top 10 neighbors:", neighbors[0, :DISPLAY_TOP_K])
+        print("First query top 10 distances:", distances[0, :DISPLAY_TOP_K])
 
     return distances, neighbors
 

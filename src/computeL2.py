@@ -1,6 +1,7 @@
 import numpy as np
+from config import GROUND_TRUTH_BATCH_SIZE, GROUND_TRUTH_TOP_K, QUERY_LIMIT, DISPLAY_TOP_K
 
-def compute_exact_ground_truth(dataset, dataset_ids, queries, top_k = 100, query_limit = 100, batch_size = 10, print_progress=True):
+def compute_exact_ground_truth(dataset, dataset_ids, queries, top_k = GROUND_TRUTH_TOP_K, query_limit = QUERY_LIMIT, batch_size = GROUND_TRUTH_BATCH_SIZE, print_progress=False):
     queries_subset = queries[:query_limit]
 
     gt_distances_batches = []
@@ -49,16 +50,16 @@ def main():
         dataset=dataset,
         dataset_ids=dataset_ids,
         queries=queries,
-        top_k=100,
-        query_limit=100,
-        batch_size=10,
+        top_k=GROUND_TRUTH_TOP_K,
+        query_limit=QUERY_LIMIT,
+        batch_size=GROUND_TRUTH_BATCH_SIZE,
         print_progress=True,
     )
 
     print("Ground truth distances shape:", gt_distances.shape)
     print("Ground truth neighbors shape:", gt_neighbors.shape)
-    print("First query top 10 neighbors:", gt_neighbors[0, :10])
-    print("First query top 10 distances:", gt_distances[0, :10])
+    print("First query top 10 neighbors:", gt_neighbors[0, :DISPLAY_TOP_K])
+    print("First query top 10 distances:", gt_distances[0, :DISPLAY_TOP_K])
 
 if __name__ == "__main__":
     main()
