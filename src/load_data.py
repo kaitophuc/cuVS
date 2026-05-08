@@ -1,6 +1,6 @@
 import numpy as np
 import pyarrow.parquet as pq
-from config import EMBEDDING_COLUMN, ID_COLUMN, QUERY_PATH, TRAIN_PATH, VECTOR_DIM
+from config import EMBEDDING_COLUMN, ID_COLUMN, QUERY_PATH, TRAIN_PATHS, VECTOR_DIM
 
 def load_parquet_vectors(path):
     table = pq.read_table(path, columns=[ID_COLUMN, EMBEDDING_COLUMN])
@@ -15,8 +15,22 @@ def load_parquet_vectors(path):
 
     return ids, embeddings
 
+def load_parquet_vector_files(paths):
+    ids_list = []
+    embeddings_list = []
+
+    for path in paths:
+        ids, embeddings = load_parquet_vectors(path)
+        ids_list.append(ids)
+        embeddings_list.append(embeddings)
+
+    all_ids = np.concatenate(ids_list, axis=0)
+    all_embeddings = np.concatenate(embeddings_list, axis=0)
+
+    return all_ids, all_embeddings
+
 def load_default_data(print_info=False):
-    dataset_ids, dataset = load_parquet_vectors(TRAIN_PATH)
+    dataset_ids, dataset = load_parquet_vector_files(TRAIN_PATHS)
     query_ids, queries = load_parquet_vectors(QUERY_PATH)
 
     if print_info:
@@ -34,6 +48,7 @@ def print_loaded_data_summary(dataset_ids, dataset, query_ids, queries):
     print("Queries dtype:", queries.dtype)
 
     print("First dataset id:", dataset_ids[0])
+    print("Last dataset id:", dataset_ids[-1])
     print("First query id:", query_ids[0])
     print("Embedding dimension:", dataset.shape[1])
 

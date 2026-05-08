@@ -28,7 +28,6 @@ def run_sweep_benchmark():
         top_k=GROUND_TRUTH_TOP_K,
         query_limit=QUERY_LIMIT,
         batch_size=GROUND_TRUTH_BATCH_SIZE,
-        print_progress=True,
     )
 
     index_params = create_index_params()

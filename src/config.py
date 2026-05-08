@@ -1,4 +1,10 @@
-TRAIN_PATH = "../openai_large_5m/train-00-of-10.parquet"
+TRAIN_PATHS = [
+    "../openai_large_5m/train-00-of-10.parquet",
+    "../openai_large_5m/train-01-of-10.parquet",
+    "../openai_large_5m/train-02-of-10.parquet",
+    "../openai_large_5m/train-03-of-10.parquet",
+]
+TRAIN_PATH = TRAIN_PATHS[0]
 QUERY_PATH = "../openai_large_5m/test.parquet"
 VECTOR_DIM = 1536
 ID_COLUMN = "id"
