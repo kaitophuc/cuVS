@@ -1,5 +1,11 @@
 from load_data import load_default_data
-from multiGPU_IVF_FLat import create_index_params, create_search_params
+from multiGPU_IVF_FLat import (
+    build_ivf_flat_index,
+    create_index_params,
+    create_multi_gpu_resources,
+    create_search_params,
+    search_ivf_flat,
+)
 from computeL2 import compute_exact_ground_truth
 from calculateRecall import calculate_recall_at_k
 from IVF_flat import K, N_PROBES_SWEEP
@@ -14,10 +20,7 @@ from config import (
     SEARCH_TIMED_RUNS,
     SEARCH_WARMUP_RUNS,
 )
-from timing_utils import measure_synchronized_wall_time, sync_all_cuda_devices
-
-import time
-from cuvs.neighbors.mg import ivf_flat
+from timing_utils import measure_synchronized_wall_time
 
 def run_sweep_benchmark():
     dataset_ids, dataset, _, queries = load_default_data()
@@ -30,6 +33,9 @@ def run_sweep_benchmark():
         batch_size=GROUND_TRUTH_BATCH_SIZE,
     )
 
+    resources = create_multi_gpu_resources()
+    sync_fn = resources.sync
+
     index_params = create_index_params()
     
     benchmark_queries = queries[:OFFLINE_QUERY_COUNT]
@@ -41,12 +47,12 @@ def run_sweep_benchmark():
     print("Queries shape:", benchmark_queries.shape)
     print("k:", K)
 
-    sync_all_cuda_devices()
-    build_start = time.perf_counter()
-    index = ivf_flat.build(index_params, dataset)
-    sync_all_cuda_devices()
-    build_end = time.perf_counter()
-    build_time = build_end - build_start
+    index, build_time = build_ivf_flat_index(
+        dataset,
+        index_params,
+        resources=resources,
+        sync_fn=sync_fn,
+    )
     print(f"IVF-Flat index built in {build_time:.2f} seconds")
 
     for n_probes in N_PROBES_SWEEP:
@@ -54,9 +60,10 @@ def run_sweep_benchmark():
         print(f"\nPerforming search with n_probes={n_probes}...")
         
         offline_summary = measure_synchronized_wall_time(
-            lambda: ivf_flat.search(search_params, index, benchmark_queries, K),
+            lambda: search_ivf_flat(index, benchmark_queries, search_params, K, resources=resources),
             warmup_runs=SEARCH_WARMUP_RUNS,
             timed_runs=SEARCH_TIMED_RUNS,
+            sync_fn=sync_fn,
         )
         distances, neighbors = offline_summary["result"]
         search_time = offline_summary["median_sec"]
@@ -67,9 +74,10 @@ def run_sweep_benchmark():
         print("First query top 10 distances:", distances[0, :DISPLAY_TOP_K])
 
         online_summary = measure_synchronized_wall_time(
-            lambda: ivf_flat.search(search_params, index, online_queries, K),
+            lambda: search_ivf_flat(index, online_queries, search_params, K, resources=resources),
             warmup_runs=SEARCH_WARMUP_RUNS,
             timed_runs=SEARCH_TIMED_RUNS,
+            sync_fn=sync_fn,
         )
 
         #Compute speed numbers

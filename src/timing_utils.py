@@ -50,20 +50,23 @@ def summarize_times(times_sec):
     }
 
 
-def measure_synchronized_wall_time(fn, warmup_runs, timed_runs):
+def measure_synchronized_wall_time(fn, warmup_runs, timed_runs, sync_fn=None):
+    if sync_fn is None:
+        sync_fn = sync_all_cuda_devices
+
     result = None
 
     for _ in range(warmup_runs):
         result = fn()
-        sync_all_cuda_devices()
+        sync_fn()
 
     times_sec = []
 
     for _ in range(timed_runs):
-        sync_all_cuda_devices()
+        sync_fn()
         start = time.perf_counter()
         result = fn()
-        sync_all_cuda_devices()
+        sync_fn()
         end = time.perf_counter()
         times_sec.append(end - start)
 

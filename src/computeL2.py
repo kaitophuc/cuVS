@@ -50,7 +50,6 @@ def main():
         top_k=GROUND_TRUTH_TOP_K,
         query_limit=QUERY_LIMIT,
         batch_size=GROUND_TRUTH_BATCH_SIZE,
-        print_progress=True,
     )
 
     print("Ground truth distances shape:", gt_distances.shape)

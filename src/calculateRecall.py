@@ -27,18 +27,20 @@ def main():
     from multiGPU_IVF_FLat import (
         build_ivf_flat_index,
         create_index_params,
+        create_multi_gpu_resources,
         create_search_params,
         search_ivf_flat,
     )
 
+    resources = create_multi_gpu_resources()
     dataset_ids, dataset, _, queries = load_default_data(print_info=True)
     describe_ivf_params(dataset, print_info=True)
 
     index_params = create_index_params()
-    index, _ = build_ivf_flat_index(dataset, index_params, print_info=True)
+    index, _ = build_ivf_flat_index(dataset, index_params, resources=resources, sync_fn=resources.sync, print_info=True)
 
     search_params = create_search_params(N_PROBES_SWEEP[-1])
-    _, neighbors = search_ivf_flat(index, queries, search_params, K, print_info=True)
+    _, neighbors = search_ivf_flat(index, queries, search_params, K, resources=resources, print_info=True)
 
     gt_distances, gt_neighbors = compute_exact_ground_truth(
         dataset=dataset,
@@ -47,7 +49,6 @@ def main():
         top_k=GROUND_TRUTH_TOP_K,
         query_limit=QUERY_LIMIT,
         batch_size=GROUND_TRUTH_BATCH_SIZE,
-        print_progress=True,
     )
 
     print("Ground truth distances shape:", gt_distances.shape)
