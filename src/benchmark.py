@@ -23,7 +23,7 @@ from config import (
 from timing_utils import measure_synchronized_wall_time
 
 def run_benchmark():
-    dataset_ids, dataset, _, queries = load_default_data()
+    dataset_ids, dataset, _, queries = load_default_data(print_info=True)
     gt_distances, gt_neighbors = get_or_compute_exact_ground_truth(
         dataset=dataset,
         dataset_ids=dataset_ids,
