@@ -6,7 +6,7 @@ from multiGPU_IVF_FLat import (
     create_search_params,
     search_ivf_flat,
 )
-from computeL2 import compute_exact_ground_truth
+from computeL2 import get_or_compute_exact_ground_truth
 from calculateRecall import calculate_recall_at_k
 from IVF_flat import K, N_PROBES_SWEEP
 from config import (
@@ -24,13 +24,14 @@ from timing_utils import measure_synchronized_wall_time
 
 def run_sweep_benchmark():
     dataset_ids, dataset, _, queries = load_default_data()
-    gt_distances, gt_neighbors = compute_exact_ground_truth(
+    gt_distances, gt_neighbors = get_or_compute_exact_ground_truth(
         dataset=dataset,
         dataset_ids=dataset_ids,
         queries=queries,
         top_k=GROUND_TRUTH_TOP_K,
         query_limit=QUERY_LIMIT,
         batch_size=GROUND_TRUTH_BATCH_SIZE,
+        print_info=True,
     )
 
     resources = create_multi_gpu_resources()

@@ -22,7 +22,7 @@ def calculate_recall_at_k(ivf_neighbors, gt_neighbors, k = K):
 
 def main():
     from IVF_flat import N_PROBES_SWEEP, describe_ivf_params
-    from computeL2 import compute_exact_ground_truth
+    from computeL2 import get_or_compute_exact_ground_truth
     from load_data import load_default_data
     from multiGPU_IVF_FLat import (
         build_ivf_flat_index,
@@ -42,13 +42,14 @@ def main():
     search_params = create_search_params(N_PROBES_SWEEP[-1])
     _, neighbors = search_ivf_flat(index, queries, search_params, K, resources=resources, print_info=True)
 
-    gt_distances, gt_neighbors = compute_exact_ground_truth(
+    gt_distances, gt_neighbors = get_or_compute_exact_ground_truth(
         dataset=dataset,
         dataset_ids=dataset_ids,
         queries=queries,
         top_k=GROUND_TRUTH_TOP_K,
         query_limit=QUERY_LIMIT,
         batch_size=GROUND_TRUTH_BATCH_SIZE,
+        print_info=True,
     )
 
     print("Ground truth distances shape:", gt_distances.shape)

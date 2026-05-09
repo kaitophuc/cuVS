@@ -1,11 +1,17 @@
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "openai_large_5m"
+
 TRAIN_PATHS = [
-    "../openai_large_5m/train-00-of-10.parquet",
-    "../openai_large_5m/train-01-of-10.parquet",
-    "../openai_large_5m/train-02-of-10.parquet",
-    "../openai_large_5m/train-03-of-10.parquet",
+    DATA_DIR / "train-00-of-10.parquet",
+    DATA_DIR / "train-01-of-10.parquet",
+    DATA_DIR / "train-02-of-10.parquet",
+    DATA_DIR / "train-03-of-10.parquet",
 ]
 TRAIN_PATH = TRAIN_PATHS[0]
-QUERY_PATH = "../openai_large_5m/test.parquet"
+QUERY_PATH = DATA_DIR / "test.parquet"
 VECTOR_DIM = 1536
 ID_COLUMN = "id"
 EMBEDDING_COLUMN = "emb"
@@ -21,6 +27,7 @@ MERGE_MODE = "merge_on_root_rank"
 GROUND_TRUTH_TOP_K = 100
 QUERY_LIMIT = 1000
 GROUND_TRUTH_BATCH_SIZE = 10
+GROUND_TRUTH_CACHE_DIR = PROJECT_ROOT / "ground_truth_cache"
 BENCHMARK_QUERY_COUNT = 1000
 DISPLAY_TOP_K = 10
 MS_PER_SECOND = 1000.0
