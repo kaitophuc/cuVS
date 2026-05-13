@@ -9,6 +9,8 @@ TRAIN_PATHS = [
     DATA_DIR / "train-01-of-10.parquet",
     DATA_DIR / "train-02-of-10.parquet",
     DATA_DIR / "train-03-of-10.parquet",
+    DATA_DIR / "train-04-of-10.parquet",
+    DATA_DIR / "train-05-of-10.parquet",
 ]
 TRAIN_PATH = TRAIN_PATHS[0]
 QUERY_PATH = DATA_DIR / "test.parquet"
