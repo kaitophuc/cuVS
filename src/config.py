@@ -11,6 +11,10 @@ TRAIN_PATHS = [
     DATA_DIR / "train-03-of-10.parquet",
     DATA_DIR / "train-04-of-10.parquet",
     DATA_DIR / "train-05-of-10.parquet",
+    DATA_DIR / "train-06-of-10.parquet",
+    DATA_DIR / "train-07-of-10.parquet",
+    DATA_DIR / "train-08-of-10.parquet",
+    DATA_DIR / "train-09-of-10.parquet",
 ]
 TRAIN_PATH = TRAIN_PATHS[0]
 QUERY_PATH = DATA_DIR / "test.parquet"
@@ -54,3 +58,26 @@ IVFPQ_EXAMPLE_NUM_SAMPLES = 100000
 IVFPQ_EXAMPLE_DIM = 96
 IVFPQ_EXAMPLE_NUM_QUERIES = 10000
 IVFPQ_EXAMPLE_N_PROBES = 20
+
+
+#=========================================#
+#CONFIG FOR IVF-PQ
+#=========================================#
+IVFPQ_N_LISTS_SWEEP = [1024, 2048, 4096]
+IVFPQ_N_PROBES_SWEEP = [32, 64, 128]
+
+IVFPQ_PQ_BITS_SWEEP = [8]
+IVFPQ_PQ_DIM_SWEEP = [384, 768, 1536]
+
+IVFPQ_KMEANS_N_ITERS = 20
+IVFPQ_KMEANS_TRAINSET_FRACTION = 0.5
+IVFPQ_CODEBOOK_KIND = "subspace"
+IVFPQ_FORCE_RANDOM_ROTATION = False
+IVFPQ_CONSERVATIVE_MEMORY_ALLOCATION = True
+IVFPQ_MAX_TRAIN_POINTS_PER_PQ_CODE = 256
+IVFPQ_CODES_LAYOUT = "interleaved"
+
+IVFPQ_LUT_DTYPE = "float32"
+IVFPQ_INTERNAL_DISTANCE_DTYPE = "float32"
+IVFPQ_COARSE_SEARCH_DTYPE = "float16"
+IVFPQ_MAX_INTERNAL_BATCH_SIZE = 4096
