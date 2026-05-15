@@ -3,7 +3,9 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pyarrow.parquet as pq
 from config import (
+    DATA_DIR,
     DISPLAY_TOP_K,
     EMBEDDING_COLUMN,
     GROUND_TRUTH_BATCH_SIZE,
@@ -17,6 +19,11 @@ from config import (
     TRAIN_PATHS,
     VECTOR_DIM,
 )
+
+PRECOMPUTED_NEIGHBORS_PATH = DATA_DIR / "neighbors.parquet"
+PRECOMPUTED_NEIGHBORS_ID_COLUMN = "id"
+PRECOMPUTED_NEIGHBORS_COLUMN = "neighbors_id"
+FULL_DATASET_ROW_COUNT = 5_000_000
 
 
 def _resolve_config_path(path):
@@ -48,6 +55,7 @@ def ground_truth_cache_metadata(top_k=GROUND_TRUTH_TOP_K, query_limit=QUERY_LIMI
     return {
         "train_paths": [_path_fingerprint(path) for path in TRAIN_PATHS],
         "query_path": _path_fingerprint(QUERY_PATH),
+        "precomputed_neighbors_path": _path_fingerprint(PRECOMPUTED_NEIGHBORS_PATH),
         "vector_dim": VECTOR_DIM,
         "id_column": ID_COLUMN,
         "embedding_column": EMBEDDING_COLUMN,
@@ -66,6 +74,63 @@ def ground_truth_cache_path(top_k=GROUND_TRUTH_TOP_K, query_limit=QUERY_LIMIT):
     file_name = f"ground_truth_q{query_limit}_k{top_k}_{cache_key}.npz"
 
     return cache_dir / file_name, metadata
+
+
+def uses_complete_default_dataset(dataset_ids):
+    expected_names = {
+        f"train-{split_id:02d}-of-10.parquet"
+        for split_id in range(10)
+    }
+    configured_names = {Path(path).name for path in TRAIN_PATHS}
+
+    if configured_names != expected_names:
+        return False
+
+    if len(dataset_ids) != FULL_DATASET_ROW_COUNT:
+        return False
+
+    return int(dataset_ids[0]) == 0 and int(dataset_ids[-1]) == FULL_DATASET_ROW_COUNT - 1
+
+
+def load_precomputed_ground_truth(top_k=GROUND_TRUTH_TOP_K, query_limit=QUERY_LIMIT):
+    neighbors_path = _resolve_config_path(PRECOMPUTED_NEIGHBORS_PATH)
+    if not neighbors_path.exists():
+        return None
+
+    table = pq.read_table(
+        str(neighbors_path),
+        columns=[PRECOMPUTED_NEIGHBORS_ID_COLUMN, PRECOMPUTED_NEIGHBORS_COLUMN],
+    )
+
+    if query_limit > table.num_rows:
+        raise ValueError(
+            f"query_limit={query_limit} exceeds precomputed ground-truth rows "
+            f"({table.num_rows}) in {neighbors_path}"
+        )
+
+    query_ids = np.asarray(table[PRECOMPUTED_NEIGHBORS_ID_COLUMN].to_numpy(), dtype=np.int64)
+    expected_query_ids = np.arange(query_limit, dtype=np.int64)
+    if not np.array_equal(query_ids[:query_limit], expected_query_ids):
+        raise ValueError(
+            "Precomputed ground truth query ids do not match the first "
+            f"{query_limit} default queries."
+        )
+
+    neighbors_lists = table[PRECOMPUTED_NEIGHBORS_COLUMN].to_pylist()[:query_limit]
+    if any(len(neighbor_ids) < top_k for neighbor_ids in neighbors_lists):
+        raise ValueError(
+            f"Precomputed ground truth in {neighbors_path} has fewer than "
+            f"{top_k} neighbors for at least one query."
+        )
+
+    neighbors = np.asarray(
+        [neighbor_ids[:top_k] for neighbor_ids in neighbors_lists],
+        dtype=np.int64,
+    )
+    distances = np.full((query_limit, top_k), np.nan, dtype=np.float32)
+
+    return distances, neighbors
+
 
 def compute_exact_ground_truth(dataset, dataset_ids, queries, top_k = GROUND_TRUTH_TOP_K, query_limit = QUERY_LIMIT, batch_size = GROUND_TRUTH_BATCH_SIZE):
     queries_subset = queries[:query_limit]
@@ -136,6 +201,22 @@ def get_or_compute_exact_ground_truth(
 ):
     cache_path, metadata = ground_truth_cache_path(top_k=top_k, query_limit=query_limit)
 
+    precomputed_ground_truth = None
+    if uses_complete_default_dataset(dataset_ids):
+        if print_info:
+            print("Complete default dataset detected. Checking precomputed ground truth.")
+        precomputed_ground_truth = load_precomputed_ground_truth(
+            top_k=top_k,
+            query_limit=query_limit,
+        )
+
+    if precomputed_ground_truth is not None:
+        distances, neighbors = precomputed_ground_truth
+        if print_info:
+            print(f"Loaded precomputed full-dataset ground truth: {PRECOMPUTED_NEIGHBORS_PATH}")
+        save_ground_truth_cache(cache_path, distances, neighbors, metadata)
+        return distances, neighbors
+
     if cache_path.exists() and not force_recompute:
         distances, neighbors, cached_metadata = load_ground_truth_cache(cache_path)
         if cached_metadata == metadata:
@@ -148,7 +229,6 @@ def get_or_compute_exact_ground_truth(
 
     if print_info:
         print(f"Computing exact ground truth and saving cache: {cache_path}")
-
     distances, neighbors = compute_exact_ground_truth(
         dataset=dataset,
         dataset_ids=dataset_ids,
