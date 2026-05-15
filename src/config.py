@@ -77,7 +77,11 @@ IVFPQ_CONSERVATIVE_MEMORY_ALLOCATION = True
 IVFPQ_MAX_TRAIN_POINTS_PER_PQ_CODE = 256
 IVFPQ_CODES_LAYOUT = "interleaved"
 
-IVFPQ_LUT_DTYPE = "float32"
-IVFPQ_INTERNAL_DISTANCE_DTYPE = "float32"
+# IVF-PQ input/search precision. Lower precision can improve speed/memory use,
+# but it can also move nearest-neighbor rankings and change recall.
+IVFPQ_DATASET_DTYPE = "float16"
+IVFPQ_QUERY_DTYPE = "float16"
+IVFPQ_LUT_DTYPE = "float16"
+IVFPQ_INTERNAL_DISTANCE_DTYPE = "float16"
 IVFPQ_COARSE_SEARCH_DTYPE = "float16"
 IVFPQ_MAX_INTERNAL_BATCH_SIZE = 4096

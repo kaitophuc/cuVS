@@ -11,10 +11,12 @@ from config import (
     DISPLAY_TOP_K,
     GROUND_TRUTH_BATCH_SIZE,
     GROUND_TRUTH_TOP_K,
+    IVFPQ_DATASET_DTYPE,
     IVFPQ_N_LISTS_SWEEP,
     IVFPQ_N_PROBES_SWEEP,
     IVFPQ_PQ_BITS_SWEEP,
     IVFPQ_PQ_DIM_SWEEP,
+    IVFPQ_QUERY_DTYPE,
     K,
     MS_PER_SECOND,
     OFFLINE_QUERY_COUNT,
@@ -30,6 +32,7 @@ from multiGPU_IVF_PQ import (
     create_index_params,
     create_multi_gpu_resources,
     create_search_params,
+    dtype_from_config,
     search_ivf_pq,
 )
 from timing_utils import measure_synchronized_wall_time
@@ -85,8 +88,6 @@ def write_results_csv(results, output_path):
 def run_ivf_pq_sweep_benchmark():
     dataset_ids, dataset, _, queries = load_default_data(print_info=True)
 
-    dataset = dataset.astype(np.float16)
-
     _, gt_neighbors = get_or_compute_exact_ground_truth(
         dataset=dataset,
         dataset_ids=dataset_ids,
@@ -97,6 +98,9 @@ def run_ivf_pq_sweep_benchmark():
         print_info=True,
     )
 
+    dataset = dataset.astype(dtype_from_config(IVFPQ_DATASET_DTYPE), copy=False)
+    queries = queries.astype(dtype_from_config(IVFPQ_QUERY_DTYPE), copy=False)
+
     resources = create_multi_gpu_resources()
     sync_fn = resources.sync
 
@@ -106,7 +110,9 @@ def run_ivf_pq_sweep_benchmark():
 
     print("\nRunning benchmark on IVF-PQ with multi-GPU search...")
     print("Dataset shape:", dataset.shape)
+    print("IVF-PQ dataset dtype:", dataset.dtype)
     print("Queries shape:", benchmark_queries.shape)
+    print("IVF-PQ queries dtype:", benchmark_queries.dtype)
     print("k:", K)
     print("n_lists sweep:", IVFPQ_N_LISTS_SWEEP)
     print("pq_bits sweep:", IVFPQ_PQ_BITS_SWEEP)
@@ -153,20 +159,25 @@ def run_ivf_pq_sweep_benchmark():
                             f"n_probes={n_probes}..."
                         )
 
-                        
-                        offline_summary = measure_synchronized_wall_time(
-                            lambda: search_ivf_pq(
-                                index,
-                                benchmark_queries,
-                                search_params,
-                                K,
-                                resources=resources,
-                            ),
-                            warmup_runs=SEARCH_WARMUP_RUNS,
-                            timed_runs=SEARCH_TIMED_RUNS,
-                            sync_fn=sync_fn,
+                        throughput_range = nvtx.start_range(
+                            "ivfpq_offline_throughput",
+                            color="green",
                         )
-
+                        try:
+                            offline_summary = measure_synchronized_wall_time(
+                                lambda: search_ivf_pq(
+                                    index,
+                                    benchmark_queries,
+                                    search_params,
+                                    K,
+                                    resources=resources,
+                                ),
+                                warmup_runs=SEARCH_WARMUP_RUNS,
+                                timed_runs=SEARCH_TIMED_RUNS,
+                                sync_fn=sync_fn,
+                            )
+                        finally:
+                            nvtx.end_range(throughput_range)
 
                         distances, neighbors = drop_timing_result(offline_summary)
                         search_time = offline_summary["median_sec"]

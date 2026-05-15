@@ -7,6 +7,7 @@ from config import (
     IVFPQ_CODES_LAYOUT,
     IVFPQ_COARSE_SEARCH_DTYPE,
     IVFPQ_CONSERVATIVE_MEMORY_ALLOCATION,
+    IVFPQ_DATASET_DTYPE,
     IVFPQ_FORCE_RANDOM_ROTATION,
     IVFPQ_INTERNAL_DISTANCE_DTYPE,
     IVFPQ_KMEANS_N_ITERS,
@@ -14,6 +15,7 @@ from config import (
     IVFPQ_LUT_DTYPE,
     IVFPQ_MAX_INTERNAL_BATCH_SIZE,
     IVFPQ_MAX_TRAIN_POINTS_PER_PQ_CODE,
+    IVFPQ_QUERY_DTYPE,
     MERGE_MODE,
     METRIC,
     SEARCH_MODE,
@@ -79,7 +81,7 @@ def build_ivf_pq_index(dataset, index_params, resources=None, sync_fn=None, prin
     if sync_fn is None:
         sync_fn = resources.sync if resources is not None else sync_all_cuda_devices
 
-    dataset = np.asarray(dataset, dtype=np.float32)
+    dataset = np.asarray(dataset, dtype=dtype_from_config(IVFPQ_DATASET_DTYPE))
 
     sync_fn()
     build_start = time.perf_counter()
@@ -125,7 +127,7 @@ def search_ivf_pq(index, queries, search_params, k, resources=None, print_info=N
         print("n_rows_per_batch:", search_params.n_rows_per_batch)
         print("max_internal_batch_size:", search_params.max_internal_batch_size)
 
-    queries = np.asarray(queries, dtype=np.float32)
+    queries = np.asarray(queries, dtype=dtype_from_config(IVFPQ_QUERY_DTYPE))
 
     distances, neighbors = ivf_pq.search(
         search_params,
