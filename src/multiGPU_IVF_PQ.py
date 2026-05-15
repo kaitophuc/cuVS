@@ -143,3 +143,83 @@ def search_ivf_pq(index, queries, search_params, k, resources=None, print_info=N
         print("Neighbors shape:", neighbors.shape)
 
     return distances, neighbors
+
+def rerank_ivf_pq_candidates_exact_l2(
+    dataset,
+    dataset_ids,
+    queries,
+    candidate_neighbors,
+    final_k,
+    batch_size = 128
+):
+    dataset = np.asarray(dataset, dtype=np.float32)
+    dataset_ids = np.asarray(dataset_ids)
+    queries = np.asarray(queries, dtype=np.float32)
+    candidate_neighbors = np.asarray(candidate_neighbors)
+
+    num_queries, candidate_k = candidate_neighbors.shape
+
+    if final_k > candidate_k:
+        raise ValueError(
+            f"final_k={final_k} cannot be larger than candidate_k={candidate_k}"
+        )
+    
+    reranked_distances = np.empty((num_queries, final_k), dtype=np.float32)
+    reranked_neighbors = np.empty((num_queries, final_k), dtype=dataset_ids.dtype)
+
+    for start in range(0, num_queries, batch_size):
+        end = min(start + batch_size, num_queries)
+
+        query_batch = queries[start:end]
+        candidate_rows = candidate_neighbors[start:end].astype(np.int64, copy=False)
+
+        candidate_vectors = dataset[candidate_rows]
+
+        query_norms = np.sum(query_batch * query_batch, axis = 1)[:, None]
+        candidate_norms = np.sum(candidate_vectors * candidate_vectors, axis = 2)
+        dot_products = np.einsum(
+            "bcd,bd->bc",
+            candidate_vectors,
+            query_batch,
+            optimize=True,
+        )
+
+        exact_distances = query_norms + candidate_norms - 2.0 * dot_products
+        exact_distances = np.maximum(exact_distances, 0.0).astype(np.float32)
+
+        top_positions = np.argpartition(
+            exact_distances,
+            final_k - 1,
+            axis=1,
+        )[:, :final_k]
+
+        top_distances = np.take_along_axis(
+            exact_distances,
+            top_positions,
+            axis=1,
+        )
+
+        sorted_order = np.argsort(top_distances, axis=1)
+
+        sorted_positions = np.take_along_axis(
+            top_positions,
+            sorted_order,
+            axis=1,
+        )
+
+        sorted_distances = np.take_along_axis(
+            top_distances,
+            sorted_order,
+            axis=1
+        )
+
+        sorted_rows = np.take_along_axis(
+            candidate_rows,
+            sorted_positions,
+            axis=1,
+        )
+
+        reranked_distances[start:end] = sorted_distances
+        reranked_neighbors[start:end] = dataset_ids[sorted_rows]
+
+    return reranked_distances, reranked_neighbors

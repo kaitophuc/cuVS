@@ -76,6 +76,9 @@ IVFPQ_FORCE_RANDOM_ROTATION = False
 IVFPQ_CONSERVATIVE_MEMORY_ALLOCATION = True
 IVFPQ_MAX_TRAIN_POINTS_PER_PQ_CODE = 256
 IVFPQ_CODES_LAYOUT = "interleaved"
+IVFPQ_RERANK_CANDIDATE_K = 100
+IVFPQ_ENABLE_EXACT_RERANK = True
+IVFPQ_RERANK_BATCH_SIZE = 128
 
 # IVF-PQ input/search precision. Lower precision can improve speed/memory use,
 # but it can also move nearest-neighbor rankings and change recall.

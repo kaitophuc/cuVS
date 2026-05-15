@@ -25,6 +25,9 @@ from config import (
     QUERY_LIMIT,
     SEARCH_TIMED_RUNS,
     SEARCH_WARMUP_RUNS,
+    IVFPQ_ENABLE_EXACT_RERANK,
+    IVFPQ_RERANK_BATCH_SIZE,
+    IVFPQ_RERANK_CANDIDATE_K,
 )
 from load_data import load_default_data
 from multiGPU_IVF_PQ import (
@@ -34,12 +37,43 @@ from multiGPU_IVF_PQ import (
     create_search_params,
     dtype_from_config,
     search_ivf_pq,
+    rerank_ivf_pq_candidates_exact_l2
 )
 from timing_utils import measure_synchronized_wall_time
 
 def drop_timing_result(summary):
     result = summary.pop("result", None)
     return result
+
+
+def search_ivf_pq_with_optional_rerank(
+    index,
+    queries,
+    search_params,
+    resources,
+    rerank_dataset,
+    dataset_ids,
+):
+    search_k = IVFPQ_RERANK_CANDIDATE_K if IVFPQ_ENABLE_EXACT_RERANK else K
+    distances, neighbors = search_ivf_pq(
+        index,
+        queries,
+        search_params,
+        search_k,
+        resources=resources,
+    )
+
+    if not IVFPQ_ENABLE_EXACT_RERANK:
+        return distances, neighbors
+
+    return rerank_ivf_pq_candidates_exact_l2(
+        dataset=rerank_dataset,
+        dataset_ids=dataset_ids,
+        queries=queries,
+        candidate_neighbors=neighbors,
+        final_k=K,
+        batch_size=IVFPQ_RERANK_BATCH_SIZE,
+    )
 
 
 def write_results_csv(results, output_path):
@@ -97,6 +131,8 @@ def run_ivf_pq_sweep_benchmark():
         batch_size=GROUND_TRUTH_BATCH_SIZE,
         print_info=True,
     )
+
+    rerank_dataset = np.asarray(dataset, dtype=np.float32)
 
     dataset = dataset.astype(dtype_from_config(IVFPQ_DATASET_DTYPE), copy=False)
     queries = queries.astype(dtype_from_config(IVFPQ_QUERY_DTYPE), copy=False)
@@ -165,12 +201,13 @@ def run_ivf_pq_sweep_benchmark():
                         )
                         try:
                             offline_summary = measure_synchronized_wall_time(
-                                lambda: search_ivf_pq(
+                                lambda: search_ivf_pq_with_optional_rerank(
                                     index,
                                     benchmark_queries,
                                     search_params,
-                                    K,
-                                    resources=resources,
+                                    resources,
+                                    rerank_dataset,
+                                    dataset_ids,
                                 ),
                                 warmup_runs=SEARCH_WARMUP_RUNS,
                                 timed_runs=SEARCH_TIMED_RUNS,
@@ -188,12 +225,13 @@ def run_ivf_pq_sweep_benchmark():
                         print("First query top 10 distances:", distances[0, :DISPLAY_TOP_K])
 
                         online_summary = measure_synchronized_wall_time(
-                            lambda: search_ivf_pq(
+                            lambda: search_ivf_pq_with_optional_rerank(
                                 index,
                                 online_queries,
                                 search_params,
-                                K,
-                                resources=resources,
+                                resources,
+                                rerank_dataset,
+                                dataset_ids,
                             ),
                             warmup_runs=SEARCH_WARMUP_RUNS,
                             timed_runs=SEARCH_TIMED_RUNS,
@@ -204,6 +242,8 @@ def run_ivf_pq_sweep_benchmark():
                         queries_per_second = num_queries / search_time
                         latency_per_query = search_time * MS_PER_SECOND / num_queries
 
+                        if IVFPQ_ENABLE_EXACT_RERANK:
+                            print("Exact rerank enabled; timed search includes candidate search and rerank.")
                         print(f"Offline batch search median: {offline_summary['median_sec']:.4f} seconds")
                         print(f"Offline batch search mean: {offline_summary['mean_sec']:.4f} seconds")
                         print(f"Offline throughput median: {queries_per_second:.2f} queries/second")
