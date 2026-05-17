@@ -19,6 +19,7 @@ from config import (
     MERGE_MODE,
     METRIC,
     SEARCH_MODE,
+    IVFPQ_RERANK_BATCH_SIZE,
 )
 from timing_utils import sync_all_cuda_devices
 from cuvs.common import MultiGpuResources
@@ -150,7 +151,7 @@ def rerank_ivf_pq_candidates_exact_l2(
     queries,
     candidate_neighbors,
     final_k,
-    batch_size = 128
+    batch_size = IVFPQ_RERANK_BATCH_SIZE
 ):
     dataset = np.asarray(dataset, dtype=np.float32)
     dataset_ids = np.asarray(dataset_ids)
