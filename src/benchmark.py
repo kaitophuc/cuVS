@@ -1,14 +1,14 @@
 from load_data import load_default_data
-from multiGPU_IVF_FLat import (
+from multi_gpu_ivf_flat import (
     build_ivf_flat_index,
     create_index_params,
     create_multi_gpu_resources,
     create_search_params,
     search_ivf_flat,
 )
-from computeL2 import get_or_compute_exact_ground_truth
-from calculateRecall import calculate_recall_at_k
-from IVF_flat import K, N_PROBES_SWEEP
+from ground_truth import get_or_compute_exact_ground_truth
+from recall import calculate_recall_at_k
+from ivf_flat_params import K, N_PROBES_SWEEP
 from config import (
     DISPLAY_TOP_K,
     GROUND_TRUTH_BATCH_SIZE,
@@ -23,6 +23,7 @@ from config import (
 from timing_utils import measure_synchronized_wall_time
 
 def run_benchmark():
+    """Run one IVF-Flat benchmark with the default configuration."""
     dataset_ids, dataset, _, queries = load_default_data(print_info=True)
     gt_distances, gt_neighbors = get_or_compute_exact_ground_truth(
         dataset=dataset,

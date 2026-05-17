@@ -1,15 +1,15 @@
 import gc
 
 from load_data import load_default_data
-from multiGPU_IVF_FLat import (
+from multi_gpu_ivf_flat import (
     build_ivf_flat_index,
     create_index_params,
     create_multi_gpu_resources,
     create_search_params,
     search_ivf_flat,
 )
-from computeL2 import get_or_compute_exact_ground_truth
-from calculateRecall import calculate_recall_at_k
+from ground_truth import get_or_compute_exact_ground_truth
+from recall import calculate_recall_at_k
 from config import (
     DISPLAY_TOP_K,
     GROUND_TRUTH_BATCH_SIZE,
@@ -33,6 +33,7 @@ def drop_timing_result(summary):
 
 
 def run_sweep_benchmark():
+    """Run the IVF-Flat parameter sweep and return per-configuration metrics."""
     dataset_ids, dataset, _, queries = load_default_data(print_info=True)
     _, gt_neighbors = get_or_compute_exact_ground_truth(
         dataset=dataset,

@@ -2,6 +2,7 @@ import config
 
 
 def main():
+    """Run the current best single IVF-PQ configuration."""
     config.IVFPQ_N_LISTS_SWEEP = [4096]
     config.IVFPQ_PQ_BITS_SWEEP = [8]
     config.IVFPQ_PQ_DIM_SWEEP = [768]

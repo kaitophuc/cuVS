@@ -133,6 +133,7 @@ def load_precomputed_ground_truth(top_k=GROUND_TRUTH_TOP_K, query_limit=QUERY_LI
 
 
 def compute_exact_ground_truth(dataset, dataset_ids, queries, top_k = GROUND_TRUTH_TOP_K, query_limit = QUERY_LIMIT, batch_size = GROUND_TRUTH_BATCH_SIZE):
+    """Compute exact nearest neighbors with batched squared L2 distance."""
     queries_subset = queries[:query_limit]
 
     gt_distances_batches = []
@@ -199,6 +200,7 @@ def get_or_compute_exact_ground_truth(
     force_recompute=False,
     print_info=False,
 ):
+    """Load cached/precomputed ground truth or compute it for the configured data."""
     cache_path, metadata = ground_truth_cache_path(top_k=top_k, query_limit=query_limit)
 
     precomputed_ground_truth = None

@@ -1,6 +1,7 @@
 from config import DISPLAY_TOP_K, GROUND_TRUTH_BATCH_SIZE, GROUND_TRUTH_TOP_K, K, QUERY_LIMIT
 
 def calculate_recall_at_k(ivf_neighbors, gt_neighbors, k = K):
+    """Compute Recall@k by comparing retrieved neighbor ids with ground truth ids."""
     num_queries = gt_neighbors.shape[0]
 
     ivf_top_k = ivf_neighbors[:num_queries, :k]
@@ -21,10 +22,10 @@ def calculate_recall_at_k(ivf_neighbors, gt_neighbors, k = K):
     return recall_at_k, total_correct, total_possible
 
 def main():
-    from IVF_flat import N_PROBES_SWEEP, describe_ivf_params
-    from computeL2 import get_or_compute_exact_ground_truth
+    from ivf_flat_params import N_PROBES_SWEEP, describe_ivf_params
+    from ground_truth import get_or_compute_exact_ground_truth
     from load_data import load_default_data
-    from multiGPU_IVF_FLat import (
+    from multi_gpu_ivf_flat import (
         build_ivf_flat_index,
         create_index_params,
         create_multi_gpu_resources,

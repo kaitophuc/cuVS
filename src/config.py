@@ -1,8 +1,10 @@
+import os
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "openai_large_5m"
+DATA_DIR = Path(os.environ.get("CUVS_BENCH_DATA_DIR", PROJECT_ROOT / "openai_large_5m")).expanduser()
+RESULTS_DIR = PROJECT_ROOT / "results"
 
 TRAIN_PATHS = [
     DATA_DIR / "train-00-of-10.parquet",
@@ -21,9 +23,9 @@ QUERY_PATH = DATA_DIR / "test.parquet"
 VECTOR_DIM = 1536
 ID_COLUMN = "id"
 EMBEDDING_COLUMN = "emb"
-DATA_CACHE_DIR = PROJECT_ROOT / "data_cache"
-USE_DATA_CACHE = True
-DATA_CACHE_MMAP = True
+DATA_CACHE_DIR = Path(os.environ.get("CUVS_BENCH_DATA_CACHE_DIR", PROJECT_ROOT / "data_cache")).expanduser()
+USE_DATA_CACHE = os.environ.get("CUVS_BENCH_USE_DATA_CACHE", "1") != "0"
+DATA_CACHE_MMAP = os.environ.get("CUVS_BENCH_DATA_CACHE_MMAP", "1") != "0"
 
 N_LISTS_SWEEP = [512, 1024, 2048, 4096]
 N_LISTS = N_LISTS_SWEEP[1]
@@ -37,7 +39,9 @@ MERGE_MODE = "merge_on_root_rank"
 GROUND_TRUTH_TOP_K = 100
 QUERY_LIMIT = 1000
 GROUND_TRUTH_BATCH_SIZE = 10
-GROUND_TRUTH_CACHE_DIR = PROJECT_ROOT / "ground_truth_cache"
+GROUND_TRUTH_CACHE_DIR = Path(
+    os.environ.get("CUVS_BENCH_GROUND_TRUTH_CACHE_DIR", PROJECT_ROOT / "ground_truth_cache")
+).expanduser()
 BENCHMARK_QUERY_COUNT = 1000
 DISPLAY_TOP_K = 10
 MS_PER_SECOND = 1000.0
@@ -60,13 +64,11 @@ IVFPQ_EXAMPLE_NUM_QUERIES = 10000
 IVFPQ_EXAMPLE_N_PROBES = 20
 
 
-#=========================================#
-#CONFIG FOR IVF-PQ
-#=========================================#
+# IVF-PQ sweep configuration.
 IVFPQ_N_LISTS_SWEEP = [1024, 2048, 4096]
 IVFPQ_N_PROBES_SWEEP = [32, 64, 128]
 
-IVFPQ_PQ_BITS_SWEEP = [8]
+IVFPQ_PQ_BITS_SWEEP = [4, 6, 8]
 IVFPQ_PQ_DIM_SWEEP = [384, 768, 1536]
 
 IVFPQ_KMEANS_N_ITERS = 20

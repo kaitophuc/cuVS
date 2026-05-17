@@ -169,6 +169,7 @@ def get_or_load_cached_data(
 
 
 def load_default_data(print_info=False):
+    """Load the configured training and query vectors, using the local cache when enabled."""
     return get_or_load_cached_data(print_info=print_info)
 
 

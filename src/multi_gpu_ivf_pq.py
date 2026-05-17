@@ -68,6 +68,7 @@ def create_index_params(
     )
 
 def build_ivf_pq_index(dataset, index_params, resources=None, sync_fn=None, print_info=False):
+    """Build a multi-GPU IVF-PQ index and return the index plus elapsed seconds."""
     if print_info:
         print("Building IVF-PQ index...")
         print("distribution_mode:", index_params.distribution_mode)
@@ -120,6 +121,7 @@ def create_search_params(
     )
 
 def search_ivf_pq(index, queries, search_params, k, resources=None, print_info=None):
+    """Search a multi-GPU IVF-PQ index and return distances and neighbor ids."""
     if print_info:
         print("\nPerforming IVF-PQ search...")
         print("n_probes:", search_params.n_probes)
@@ -153,6 +155,7 @@ def rerank_ivf_pq_candidates_exact_l2(
     final_k,
     batch_size = IVFPQ_RERANK_BATCH_SIZE
 ):
+    """Rerank IVF-PQ candidate ids with exact host-side squared L2 distance."""
     dataset = np.asarray(dataset, dtype=np.float32)
     dataset_ids = np.asarray(dataset_ids)
     queries = np.asarray(queries, dtype=np.float32)

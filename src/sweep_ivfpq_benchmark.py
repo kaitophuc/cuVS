@@ -1,12 +1,11 @@
 import csv
 import gc
 import numpy as np
-from pathlib import Path
 
 import nvtx
 
-from calculateRecall import calculate_recall_at_k
-from computeL2 import get_or_compute_exact_ground_truth
+from recall import calculate_recall_at_k
+from ground_truth import get_or_compute_exact_ground_truth
 from config import (
     DISPLAY_TOP_K,
     GROUND_TRUTH_BATCH_SIZE,
@@ -21,23 +20,23 @@ from config import (
     MS_PER_SECOND,
     OFFLINE_QUERY_COUNT,
     ONLINE_QUERY_COUNT,
-    PROJECT_ROOT,
     QUERY_LIMIT,
     SEARCH_TIMED_RUNS,
     SEARCH_WARMUP_RUNS,
     IVFPQ_ENABLE_EXACT_RERANK,
     IVFPQ_RERANK_BATCH_SIZE,
     IVFPQ_RERANK_CANDIDATE_K,
+    RESULTS_DIR,
 )
 from load_data import load_default_data
-from multiGPU_IVF_PQ import (
+from multi_gpu_ivf_pq import (
     build_ivf_pq_index,
     create_index_params,
     create_multi_gpu_resources,
     create_search_params,
     dtype_from_config,
     search_ivf_pq,
-    rerank_ivf_pq_candidates_exact_l2
+    rerank_ivf_pq_candidates_exact_l2,
 )
 from timing_utils import measure_synchronized_wall_time
 
@@ -120,6 +119,7 @@ def write_results_csv(results, output_path):
             })
 
 def run_ivf_pq_sweep_benchmark():
+    """Run the IVF-PQ sweep, save a CSV summary, and return collected metrics."""
     dataset_ids, dataset, _, queries = load_default_data(print_info=True)
 
     _, gt_neighbors = get_or_compute_exact_ground_truth(
@@ -293,7 +293,7 @@ def run_ivf_pq_sweep_benchmark():
                     gc.collect()
                     sync_fn()
 
-    output_path = PROJECT_ROOT / "ivfpq_sweep_results.csv"
+    output_path = RESULTS_DIR / "ivfpq_sweep_results.csv"
     write_results_csv(results, output_path)
     print(f"\nSaved IVF-PQ sweep results to: {output_path}")
 

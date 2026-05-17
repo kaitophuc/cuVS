@@ -1,2 +1,0 @@
-n_lists,pq_bits,pq_dim,n_probes,build_time,search_time,queries_per_second,latency_per_query,online_median_latency_ms,online_p95_latency_ms,recall_at_10,total_correct,total_possible
-4096,8,768,32,28.459298828005558,0.20178236450010445,4955.834482747784,0.20178236450010445,0.7189770039985888,0.9001020080177113,0.9516,9516,10000

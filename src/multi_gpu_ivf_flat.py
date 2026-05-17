@@ -1,5 +1,5 @@
 import time
-from IVF_flat import N_LISTS, N_PROBES_SWEEP, K, METRIC, DISTRIBUTION_MODE, describe_ivf_params
+from ivf_flat_params import N_LISTS, N_PROBES_SWEEP, K, METRIC, DISTRIBUTION_MODE, describe_ivf_params
 from config import DISPLAY_TOP_K, MERGE_MODE, SEARCH_MODE
 from load_data import load_default_data
 from timing_utils import sync_all_cuda_devices
@@ -21,6 +21,7 @@ def create_index_params(
     )
 
 def build_ivf_flat_index(dataset, index_params, resources=None, sync_fn=None, print_info=False):
+    """Build a multi-GPU IVF-Flat index and return the index plus elapsed seconds."""
     if print_info:
         print("Building IVF-Flat index...")
         print("distribution_mode:", index_params.distribution_mode)
@@ -58,6 +59,7 @@ def create_search_params(
     )
 
 def search_ivf_flat(index, queries, search_params, k, resources=None, print_info=False):
+    """Search a multi-GPU IVF-Flat index and return distances and neighbor ids."""
     if print_info:
         print("\nPerforming IVF-Flat search...")
         print("n probes:", str(search_params.n_probes) + " (how many IVF lists are searched)")
