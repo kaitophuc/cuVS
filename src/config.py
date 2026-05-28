@@ -2,6 +2,14 @@ import os
 from pathlib import Path
 
 
+def _parse_optional_int_list_env(name):
+    raw_value = os.environ.get(name, "")
+    if not raw_value.strip():
+        return None
+
+    return [int(value.strip()) for value in raw_value.split(",") if value.strip()]
+
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("CUVS_BENCH_DATA_DIR", PROJECT_ROOT / "openai_large_5m")).expanduser()
 RESULTS_DIR = PROJECT_ROOT / "results"
@@ -83,12 +91,7 @@ IVFPQ_ENABLE_EXACT_RERANK = True
 IVFPQ_RERANK_BATCH_SIZE = int(os.environ.get("CUVS_BENCH_IVFPQ_RERANK_BATCH_SIZE", "512"))
 IVFPQ_RERANK_BACKEND = os.environ.get("CUVS_BENCH_IVFPQ_RERANK_BACKEND", "multi_gpu")
 IVFPQ_RERANK_DEVICE_ID = int(os.environ.get("CUVS_BENCH_IVFPQ_RERANK_DEVICE_ID", "0"))
-_IVFPQ_RERANK_DEVICE_IDS_RAW = os.environ.get("CUVS_BENCH_IVFPQ_RERANK_DEVICE_IDS", "")
-IVFPQ_RERANK_DEVICE_IDS = (
-    [int(device_id.strip()) for device_id in _IVFPQ_RERANK_DEVICE_IDS_RAW.split(",") if device_id.strip()]
-    if _IVFPQ_RERANK_DEVICE_IDS_RAW.strip()
-    else None
-)
+IVFPQ_RERANK_DEVICE_IDS = _parse_optional_int_list_env("CUVS_BENCH_IVFPQ_RERANK_DEVICE_IDS")
 
 # IVF-PQ input/search precision. Lower precision can improve speed/memory use,
 # but it can also move nearest-neighbor rankings and change recall.

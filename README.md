@@ -22,13 +22,18 @@ src/
   ground_truth.py            Exact/precomputed ground-truth loading
   recall.py                  Recall@k calculation
   multi_gpu_ivf_flat.py      Multi-GPU IVF-Flat wrappers
-  multi_gpu_ivf_pq.py        Multi-GPU IVF-PQ wrappers and exact reranking
+  multi_gpu_ivf_pq.py        Multi-GPU IVF-PQ wrappers
+  rerank/
+    ivfpq.py                 Exact IVF-PQ rerank backends
+    cuda/                    CUDA source for GPU exact rerank
+    extensions/              Compiled rerank extension output
+    build_extension.py       Build helper for the CUDA rerank extension
   multi_gpu_cagra.py         Multi-GPU CAGRA wrappers
   benchmark.py               Single IVF-Flat benchmark
   sweep_benchmark.py         IVF-Flat parameter sweep
   sweep_ivfpq_benchmark.py   IVF-PQ parameter sweep
   run_ivf_pq_optimized.py    Current best single IVF-PQ run
-  smoke_test.py              Tiny NumPy-only sanity check
+  smoke_test.py              Tiny correctness checks for recall and optional GPU rerank
 docs/
   profiling_notes.md         Nsight profiling commands and analysis notes
 results/
@@ -162,7 +167,7 @@ fallback.
 
 ## Tests
 
-Run the tiny NumPy-only smoke test:
+Run the smoke test:
 
 ```bash
 python src/smoke_test.py
@@ -174,8 +179,8 @@ Run the lightweight unit test:
 python -m unittest discover -s tests
 ```
 
-This test does not require GPUs or the full dataset. The full benchmark scripts require a
-working CUDA/cuVS environment and the dataset files described above.
+The smoke test skips the GPU rerank check when CUDA is unavailable. The full benchmark
+scripts require a working CUDA/cuVS environment and the dataset files described above.
 
 ## Profiling
 

@@ -27,7 +27,7 @@ nsys profile \
 The main profiling question is how much time is spent in:
 
 - IVF-PQ candidate search on the GPUs.
-- Host-side exact squared-L2 reranking.
+- Exact squared-L2 reranking and rerank data movement.
 - Data movement between host memory and GPU memory.
 - Result merging across GPUs.
 
@@ -39,10 +39,11 @@ python src/run_ivf_pq_optimized.py
 
 ## Rebuild CUDA Rerank Extension
 
-The optimized exact rerank backend is built from `src/single_gpu_ivfpq_rerank.cu`:
+The optimized exact rerank backend is built from `src/rerank/cuda/ivfpq_gpu_rerank.cu`.
+The compiled extension is written to `src/rerank/extensions/`.
 
 ```bash
-/home/phuc/Work/cuVS/.conda/bin/python src/build_ivfpq_gpu_rerank.py
+/home/phuc/Work/cuVS/.conda/bin/python src/rerank/build_extension.py
 ```
 
 The reranker uses resident GPU dataset shards when memory allows. On smaller GPUs it

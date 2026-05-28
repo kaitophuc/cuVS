@@ -6,7 +6,8 @@ from pathlib import Path
 
 
 def main():
-    root_dir = Path(__file__).resolve().parent.parent
+    root_dir = Path(__file__).resolve().parents[2]
+    rerank_dir = root_dir / "src" / "rerank"
     python_bin = Path(sys.executable).resolve()
     conda_prefix = Path(os.environ.get("CONDA_PREFIX", python_bin.parents[1])).resolve()
     nvcc = Path(os.environ.get("NVCC", conda_prefix / "bin" / "nvcc")).resolve()
@@ -17,8 +18,11 @@ def main():
         text=True,
     ).split()
 
-    output_path = root_dir / "src" / f"ivfpq_gpu_rerank{ext_suffix}"
-    source_path = root_dir / "src" / "single_gpu_ivfpq_rerank.cu"
+    output_dir = rerank_dir / "extensions"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = output_dir / f"ivfpq_gpu_rerank{ext_suffix}"
+    source_path = rerank_dir / "cuda" / "ivfpq_gpu_rerank.cu"
 
     command = [
         str(nvcc),

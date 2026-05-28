@@ -37,6 +37,8 @@ from multi_gpu_ivf_pq import (
     create_search_params,
     dtype_from_config,
     search_ivf_pq,
+)
+from rerank import (
     create_exact_reranker,
     rerank_ivf_pq_candidates_exact_l2,
 )

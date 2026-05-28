@@ -37,7 +37,7 @@ def main():
     print(f"Synthetic Recall@2: {recall:.4f} ({total_correct}/{total_possible})")
 
     try:
-        from multi_gpu_ivf_pq import (
+        from rerank import (
             create_exact_reranker,
             rerank_ivf_pq_candidates_exact_l2_cpu,
         )
