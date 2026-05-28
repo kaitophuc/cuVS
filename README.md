@@ -156,7 +156,9 @@ The default benchmark settings live in `src/config.py`. Important values include
 - `MERGE_MODE = "merge_on_root_rank"`
 
 The current IVF-PQ configuration uses float16 inputs/search internals plus optional exact
-host-side reranking of `IVFPQ_RERANK_CANDIDATE_K = 100` candidates.
+reranking of `IVFPQ_RERANK_CANDIDATE_K = 100` candidates. The default rerank backend is
+the CUDA multi-GPU extension; use `CUVS_BENCH_IVFPQ_RERANK_BACKEND=cpu` for the host
+fallback.
 
 ## Tests
 

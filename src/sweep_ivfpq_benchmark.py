@@ -24,6 +24,7 @@ from config import (
     SEARCH_TIMED_RUNS,
     SEARCH_WARMUP_RUNS,
     IVFPQ_ENABLE_EXACT_RERANK,
+    IVFPQ_RERANK_BACKEND,
     IVFPQ_RERANK_BATCH_SIZE,
     IVFPQ_RERANK_CANDIDATE_K,
     RESULTS_DIR,
@@ -36,6 +37,7 @@ from multi_gpu_ivf_pq import (
     create_search_params,
     dtype_from_config,
     search_ivf_pq,
+    create_exact_reranker,
     rerank_ivf_pq_candidates_exact_l2,
 )
 from timing_utils import measure_synchronized_wall_time
@@ -52,6 +54,7 @@ def search_ivf_pq_with_optional_rerank(
     resources,
     rerank_dataset,
     dataset_ids,
+    reranker=None,
 ):
     search_k = IVFPQ_RERANK_CANDIDATE_K if IVFPQ_ENABLE_EXACT_RERANK else K
     distances, neighbors = search_ivf_pq(
@@ -72,6 +75,7 @@ def search_ivf_pq_with_optional_rerank(
         candidate_neighbors=neighbors,
         final_k=K,
         batch_size=IVFPQ_RERANK_BATCH_SIZE,
+        reranker=reranker,
     )
 
 
@@ -183,6 +187,18 @@ def run_ivf_pq_sweep_benchmark():
                 )
                 print(f"IVF-PQ index built in {build_time:.2f} seconds")
 
+                reranker = None
+                if IVFPQ_ENABLE_EXACT_RERANK and IVFPQ_RERANK_BACKEND == "multi_gpu":
+                    print("Creating multi-GPU exact reranker...")
+                    reranker = create_exact_reranker(
+                        dataset=rerank_dataset,
+                        dataset_ids=dataset_ids,
+                        final_k=K,
+                        candidate_k=IVFPQ_RERANK_CANDIDATE_K,
+                        batch_size=IVFPQ_RERANK_BATCH_SIZE,
+                    )
+                    print(f"Exact reranker mode: {getattr(reranker, 'mode', 'unknown')}")
+
                 try:
                     for n_probes in IVFPQ_N_PROBES_SWEEP:
                         config_number += 1
@@ -208,6 +224,7 @@ def run_ivf_pq_sweep_benchmark():
                                     resources,
                                     rerank_dataset,
                                     dataset_ids,
+                                    reranker,
                                 ),
                                 warmup_runs=SEARCH_WARMUP_RUNS,
                                 timed_runs=SEARCH_TIMED_RUNS,
@@ -232,6 +249,7 @@ def run_ivf_pq_sweep_benchmark():
                                 resources,
                                 rerank_dataset,
                                 dataset_ids,
+                                reranker,
                             ),
                             warmup_runs=SEARCH_WARMUP_RUNS,
                             timed_runs=SEARCH_TIMED_RUNS,
@@ -289,6 +307,7 @@ def run_ivf_pq_sweep_benchmark():
 
                 finally:
                     sync_fn()
+                    del reranker
                     del index
                     gc.collect()
                     sync_fn()

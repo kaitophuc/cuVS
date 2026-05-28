@@ -36,6 +36,78 @@ def main():
 
     print(f"Synthetic Recall@2: {recall:.4f} ({total_correct}/{total_possible})")
 
+    try:
+        from multi_gpu_ivf_pq import (
+            create_exact_reranker,
+            rerank_ivf_pq_candidates_exact_l2_cpu,
+        )
+    except Exception as exc:
+        print(f"Multi-GPU exact rerank smoke test skipped: {exc}")
+        return
+
+    dataset_ids = np.array([10, 11, 12, 13, 14], dtype=np.int64)
+    gpu_dataset = np.array(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [2.0, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    gpu_queries = np.array(
+        [
+            [0.1, 0.0],
+            [0.9, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    candidates = np.array(
+        [
+            [0, 1, 2, 4],
+            [3, 1, 2, 4],
+        ],
+        dtype=np.int64,
+    )
+
+    expected_distances, expected_neighbors = rerank_ivf_pq_candidates_exact_l2_cpu(
+        gpu_dataset,
+        dataset_ids,
+        gpu_queries,
+        candidates,
+        final_k=2,
+        batch_size=2,
+    )
+
+    try:
+        reranker = create_exact_reranker(
+            gpu_dataset,
+            dataset_ids,
+            final_k=2,
+            candidate_k=candidates.shape[1],
+            batch_size=2,
+        )
+    except Exception as exc:
+        print(f"Multi-GPU exact rerank smoke test skipped: {exc}")
+        return
+
+    actual_distances, actual_neighbors = reranker.rerank(gpu_queries, candidates)
+
+    np.testing.assert_allclose(actual_distances, expected_distances, rtol=1e-5, atol=1e-5)
+    np.testing.assert_array_equal(actual_neighbors, expected_neighbors)
+
+    invalid_candidates = candidates.copy()
+    invalid_candidates[0, 0] = gpu_dataset.shape[0]
+    try:
+        reranker.rerank(gpu_queries, invalid_candidates)
+        raise AssertionError("invalid candidate row did not raise")
+    except Exception as exc:
+        if "invalid dataset row index" not in str(exc):
+            raise
+
+    print("Multi-GPU exact rerank smoke test passed.")
+
 
 if __name__ == "__main__":
     main()

@@ -80,7 +80,15 @@ IVFPQ_MAX_TRAIN_POINTS_PER_PQ_CODE = 256
 IVFPQ_CODES_LAYOUT = "interleaved"
 IVFPQ_RERANK_CANDIDATE_K = 100
 IVFPQ_ENABLE_EXACT_RERANK = True
-IVFPQ_RERANK_BATCH_SIZE = 128
+IVFPQ_RERANK_BATCH_SIZE = int(os.environ.get("CUVS_BENCH_IVFPQ_RERANK_BATCH_SIZE", "512"))
+IVFPQ_RERANK_BACKEND = os.environ.get("CUVS_BENCH_IVFPQ_RERANK_BACKEND", "multi_gpu")
+IVFPQ_RERANK_DEVICE_ID = int(os.environ.get("CUVS_BENCH_IVFPQ_RERANK_DEVICE_ID", "0"))
+_IVFPQ_RERANK_DEVICE_IDS_RAW = os.environ.get("CUVS_BENCH_IVFPQ_RERANK_DEVICE_IDS", "")
+IVFPQ_RERANK_DEVICE_IDS = (
+    [int(device_id.strip()) for device_id in _IVFPQ_RERANK_DEVICE_IDS_RAW.split(",") if device_id.strip()]
+    if _IVFPQ_RERANK_DEVICE_IDS_RAW.strip()
+    else None
+)
 
 # IVF-PQ input/search precision. Lower precision can improve speed/memory use,
 # but it can also move nearest-neighbor rankings and change recall.

@@ -16,14 +16,20 @@ from config import (
     IVFPQ_MAX_INTERNAL_BATCH_SIZE,
     IVFPQ_MAX_TRAIN_POINTS_PER_PQ_CODE,
     IVFPQ_QUERY_DTYPE,
+    IVFPQ_RERANK_BACKEND,
     MERGE_MODE,
     METRIC,
     SEARCH_MODE,
     IVFPQ_RERANK_BATCH_SIZE,
+    IVFPQ_RERANK_DEVICE_ID,
+    IVFPQ_RERANK_DEVICE_IDS,
 )
 from timing_utils import sync_all_cuda_devices
 from cuvs.common import MultiGpuResources
 from cuvs.neighbors.mg import ivf_pq
+
+_gpu_rerank_fn = None
+_multi_gpu_reranker_cls = None
 
 def create_multi_gpu_resources(device_ids=None):
     return MultiGpuResources(device_ids=device_ids)
@@ -52,6 +58,7 @@ def create_index_params(
     force_random_rotation=IVFPQ_FORCE_RANDOM_ROTATION,
     conservative_memory_allocation=IVFPQ_CONSERVATIVE_MEMORY_ALLOCATION,
     max_train_points_per_pq_code=IVFPQ_MAX_TRAIN_POINTS_PER_PQ_CODE,
+    codes_layout=IVFPQ_CODES_LAYOUT,
 ):
     return ivf_pq.IndexParams(
         distribution_mode=distribution_mode,
@@ -65,6 +72,7 @@ def create_index_params(
         force_random_rotation=force_random_rotation,
         conservative_memory_allocation=conservative_memory_allocation,
         max_train_points_per_pq_code=max_train_points_per_pq_code,
+        codes_layout=codes_layout,
     )
 
 def build_ivf_pq_index(dataset, index_params, resources=None, sync_fn=None, print_info=False):
@@ -147,13 +155,92 @@ def search_ivf_pq(index, queries, search_params, k, resources=None, print_info=N
 
     return distances, neighbors
 
-def rerank_ivf_pq_candidates_exact_l2(
+def _load_gpu_rerank_fn():
+    global _gpu_rerank_fn
+
+    if _gpu_rerank_fn is None:
+        from ivfpq_gpu_rerank import rerank_ivf_pq_candidates_exact_l2_gpu
+
+        _gpu_rerank_fn = rerank_ivf_pq_candidates_exact_l2_gpu
+
+    return _gpu_rerank_fn
+
+
+def _load_multi_gpu_reranker_cls():
+    global _multi_gpu_reranker_cls
+
+    if _multi_gpu_reranker_cls is None:
+        from ivfpq_gpu_rerank import MultiGpuExactReranker
+
+        _multi_gpu_reranker_cls = MultiGpuExactReranker
+
+    return _multi_gpu_reranker_cls
+
+
+def create_exact_reranker(
+    dataset,
+    dataset_ids,
+    final_k,
+    candidate_k,
+    batch_size=IVFPQ_RERANK_BATCH_SIZE,
+    device_ids=IVFPQ_RERANK_DEVICE_IDS,
+):
+    """Create a stateful CUDA exact reranker that uploads dataset shards once."""
+    reranker_cls = _load_multi_gpu_reranker_cls()
+    return reranker_cls(
+        np.asarray(dataset, dtype=np.float32),
+        np.asarray(dataset_ids, dtype=np.int64),
+        final_k,
+        candidate_k,
+        batch_size,
+        device_ids,
+    )
+
+
+def rerank_ivf_pq_candidates_exact_l2_gpu(
     dataset,
     dataset_ids,
     queries,
     candidate_neighbors,
     final_k,
-    batch_size = IVFPQ_RERANK_BATCH_SIZE
+    batch_size=IVFPQ_RERANK_BATCH_SIZE,
+    device_id=IVFPQ_RERANK_DEVICE_ID,
+):
+    """Rerank IVF-PQ candidate ids with exact squared L2 using one CUDA device."""
+    gpu_rerank_fn = _load_gpu_rerank_fn()
+    return gpu_rerank_fn(
+        np.asarray(dataset, dtype=np.float32),
+        np.asarray(dataset_ids, dtype=np.int64),
+        np.asarray(queries, dtype=np.float32),
+        np.asarray(candidate_neighbors, dtype=np.int64),
+        final_k,
+        batch_size,
+        device_id,
+    )
+
+
+def rerank_ivf_pq_candidates_exact_l2_multi_gpu(
+    reranker,
+    queries,
+    candidate_neighbors,
+):
+    """Rerank candidates with a preloaded multi-GPU exact reranker."""
+    if reranker is None:
+        raise ValueError("multi_gpu rerank backend requires a pre-created reranker")
+
+    return reranker.rerank(
+        np.asarray(queries, dtype=np.float32),
+        np.asarray(candidate_neighbors, dtype=np.int64),
+    )
+
+
+def rerank_ivf_pq_candidates_exact_l2_cpu(
+    dataset,
+    dataset_ids,
+    queries,
+    candidate_neighbors,
+    final_k,
+    batch_size=IVFPQ_RERANK_BATCH_SIZE,
 ):
     """Rerank IVF-PQ candidate ids with exact host-side squared L2 distance."""
     dataset = np.asarray(dataset, dtype=np.float32)
@@ -227,3 +314,54 @@ def rerank_ivf_pq_candidates_exact_l2(
         reranked_neighbors[start:end] = dataset_ids[sorted_rows]
 
     return reranked_distances, reranked_neighbors
+
+
+def rerank_ivf_pq_candidates_exact_l2(
+    dataset,
+    dataset_ids,
+    queries,
+    candidate_neighbors,
+    final_k,
+    batch_size=IVFPQ_RERANK_BATCH_SIZE,
+    backend=IVFPQ_RERANK_BACKEND,
+    reranker=None,
+):
+    """Rerank IVF-PQ candidate ids using the configured exact rerank backend."""
+    if backend == "multi_gpu":
+        if reranker is None:
+            reranker = create_exact_reranker(
+                dataset=dataset,
+                dataset_ids=dataset_ids,
+                final_k=final_k,
+                candidate_k=np.asarray(candidate_neighbors).shape[1],
+                batch_size=batch_size,
+            )
+        return rerank_ivf_pq_candidates_exact_l2_multi_gpu(
+            reranker=reranker,
+            queries=queries,
+            candidate_neighbors=candidate_neighbors,
+        )
+
+    if backend == "gpu":
+        return rerank_ivf_pq_candidates_exact_l2_gpu(
+            dataset=dataset,
+            dataset_ids=dataset_ids,
+            queries=queries,
+            candidate_neighbors=candidate_neighbors,
+            final_k=final_k,
+            batch_size=batch_size,
+        )
+
+    if backend == "cpu":
+        return rerank_ivf_pq_candidates_exact_l2_cpu(
+            dataset=dataset,
+            dataset_ids=dataset_ids,
+            queries=queries,
+            candidate_neighbors=candidate_neighbors,
+            final_k=final_k,
+            batch_size=batch_size,
+        )
+
+    raise ValueError(
+        f"Unsupported IVFPQ_RERANK_BACKEND={backend!r}; expected 'multi_gpu', 'gpu', or 'cpu'"
+    )

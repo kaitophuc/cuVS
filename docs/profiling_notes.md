@@ -36,3 +36,23 @@ The current optimized entrypoint is:
 ```bash
 python src/run_ivf_pq_optimized.py
 ```
+
+## Rebuild CUDA Rerank Extension
+
+The optimized exact rerank backend is built from `src/single_gpu_ivfpq_rerank.cu`:
+
+```bash
+/home/phuc/Work/cuVS/.conda/bin/python src/build_ivfpq_gpu_rerank.py
+```
+
+The reranker uses resident GPU dataset shards when memory allows. On smaller GPUs it
+automatically falls back to staged mode, which keeps reusable CUDA buffers and pinned
+host staging while packing only the candidates owned by each GPU.
+
+Run the optimized multi-GPU rerank benchmark with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+CUVS_BENCH_IVFPQ_RERANK_BACKEND=multi_gpu \
+/home/phuc/Work/cuVS/.conda/bin/python src/run_ivf_pq_optimized.py
+```
