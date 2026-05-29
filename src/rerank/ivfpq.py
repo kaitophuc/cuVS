@@ -9,11 +9,12 @@ from config import (
 )
 
 
-SUPPORTED_RERANK_BACKENDS = {"multi_gpu", "gpu", "cpu"}
+SUPPORTED_RERANK_BACKENDS = {"session", "multi_gpu", "gpu", "cpu"}
 SUPPORTED_RERANK_STORAGE_DTYPES = {"float32", "float16"}
 
 _single_gpu_rerank_fn = None
 _multi_gpu_reranker_cls = None
+_search_rerank_session_cls = None
 
 
 def _as_float32(array):
@@ -48,6 +49,17 @@ def _load_multi_gpu_reranker_cls():
     return _multi_gpu_reranker_cls
 
 
+def _load_search_rerank_session_cls():
+    global _search_rerank_session_cls
+
+    if _search_rerank_session_cls is None:
+        from rerank.extensions.ivfpq_gpu_rerank import IvfPqSearchRerankSession
+
+        _search_rerank_session_cls = IvfPqSearchRerankSession
+
+    return _search_rerank_session_cls
+
+
 def create_exact_reranker(
     dataset,
     dataset_ids,
@@ -73,6 +85,43 @@ def create_exact_reranker(
         batch_size,
         device_ids,
         storage_dtype,
+    )
+
+
+def create_ivfpq_search_rerank_session(
+    index_dataset,
+    rerank_dataset,
+    dataset_ids,
+    final_k,
+    candidate_k,
+    batch_size=IVFPQ_RERANK_BATCH_SIZE,
+    device_ids=IVFPQ_RERANK_DEVICE_IDS,
+    n_lists=4096,
+    pq_bits=4,
+    pq_dim=384,
+    n_probes=32,
+    storage_dtype=IVFPQ_RERANK_STORAGE_DTYPE,
+):
+    """Create a C++ cuVS IVF-PQ search plus resident fp16 rerank session."""
+    if storage_dtype != "float16":
+        raise ValueError(
+            "The session backend currently supports only "
+            "CUVS_BENCH_IVFPQ_RERANK_STORAGE_DTYPE=float16"
+        )
+
+    session_cls = _load_search_rerank_session_cls()
+    return session_cls(
+        np.ascontiguousarray(index_dataset, dtype=np.float16),
+        _as_float32(rerank_dataset),
+        _as_int64(dataset_ids),
+        final_k,
+        candidate_k,
+        batch_size,
+        device_ids,
+        n_lists,
+        pq_bits,
+        pq_dim,
+        n_probes,
     )
 
 
@@ -214,6 +263,13 @@ def rerank_ivf_pq_candidates_exact_l2(
             candidate_neighbors=candidate_neighbors,
             final_k=final_k,
             batch_size=batch_size,
+        )
+
+    if backend == "session":
+        raise ValueError(
+            "The session backend owns both IVF-PQ search and rerank; use "
+            "create_ivfpq_search_rerank_session(...).search_rerank(queries) "
+            "instead of the standalone rerank helper."
         )
 
     expected = ", ".join(sorted(SUPPORTED_RERANK_BACKENDS))

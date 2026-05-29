@@ -4,6 +4,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -12,6 +13,11 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cuvs/distance/distance.hpp>
+#include <cuvs/neighbors/ivf_pq.hpp>
+#include <nvtx3/nvToolsExt.h>
+#include <raft/core/device_resources_snmg.hpp>
+#include <raft/core/host_mdspan.hpp>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -113,6 +119,22 @@ private:
     int previous_device_ = 0;
 };
 
+class ScopedNvtxRange {
+public:
+    explicit ScopedNvtxRange(const char* name)
+    {
+        nvtxRangePushA(name);
+    }
+
+    ScopedNvtxRange(const ScopedNvtxRange&) = delete;
+    ScopedNvtxRange& operator=(const ScopedNvtxRange&) = delete;
+
+    ~ScopedNvtxRange()
+    {
+        nvtxRangePop();
+    }
+};
+
 template <typename T>
 class PinnedBuffer {
 public:
@@ -194,6 +216,7 @@ private:
 struct SlotBuffers {
     cudaStream_t stream = nullptr;
     float* d_queries = nullptr;
+    __half* d_queries_half = nullptr;
     int64_t* d_candidates = nullptr;
     float* d_compact_dataset = nullptr;
     int64_t* d_compact_offsets = nullptr;
@@ -254,6 +277,10 @@ struct DeviceState {
                 cudaFree(slot.d_queries);
                 slot.d_queries = nullptr;
             }
+            if (slot.d_queries_half != nullptr) {
+                cudaFree(slot.d_queries_half);
+                slot.d_queries_half = nullptr;
+            }
             if (slot.d_candidates != nullptr) {
                 cudaFree(slot.d_candidates);
                 slot.d_candidates = nullptr;
@@ -290,6 +317,7 @@ struct DeviceState {
 
 struct HostSlot {
     PinnedBuffer<float> queries;
+    PinnedBuffer<__half> queries_half;
     PinnedBuffer<int64_t> candidates;
     std::vector<PinnedBuffer<float>> compact_datasets;
     std::vector<PinnedBuffer<int64_t>> compact_offsets;
@@ -430,6 +458,52 @@ __global__ void compute_candidate_l2_half_kernel(
         for (int64_t d = thread_idx; d < dim; d += blockDim.x) {
             const float dataset_value = __half2float(dataset_row[d]);
             const float diff = query_row[d] - dataset_value;
+            sum += diff * diff;
+        }
+    } else {
+        sum = (thread_idx == 0) ? INFINITY : 0.0f;
+    }
+
+    partial_sums[thread_idx] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (thread_idx < stride) {
+            partial_sums[thread_idx] += partial_sums[thread_idx + stride];
+        }
+        __syncthreads();
+    }
+
+    if (thread_idx == 0) {
+        candidate_distances[query_idx * candidate_k + candidate_idx] = partial_sums[0];
+    }
+}
+
+__global__ void compute_candidate_l2_half_query_half_dataset_kernel(
+    const __half* __restrict__ dataset_shard,
+    int64_t shard_start,
+    int64_t shard_end,
+    int64_t dim,
+    const __half* __restrict__ queries,
+    const int64_t* __restrict__ candidates,
+    int64_t candidate_k,
+    float* __restrict__ candidate_distances)
+{
+    const int64_t candidate_idx = blockIdx.x;
+    const int64_t query_idx = blockIdx.y;
+    const int thread_idx = threadIdx.x;
+    const int64_t row = candidates[query_idx * candidate_k + candidate_idx];
+
+    extern __shared__ float partial_sums[];
+    float sum = 0.0f;
+
+    if (row >= shard_start && row < shard_end) {
+        const int64_t local_row = row - shard_start;
+        const __half* dataset_row = dataset_shard + local_row * dim;
+        const __half* query_row = queries + query_idx * dim;
+
+        for (int64_t d = thread_idx; d < dim; d += blockDim.x) {
+            const float diff = __half2float(query_row[d]) - __half2float(dataset_row[d]);
             sum += diff * diff;
         }
     } else {
@@ -734,6 +808,43 @@ public:
         return py::make_tuple(out_distances, out_neighbors);
     }
 
+    void rerank_raw_half_queries(
+        const __half* queries_ptr,
+        const int64_t* candidates_ptr,
+        int64_t n_queries,
+        float* out_distances_ptr,
+        int64_t* out_neighbors_ptr)
+    {
+        if (active_dataset_mode_ != ActiveDatasetMode::ResidentFloat16) {
+            throw std::runtime_error(
+                "rerank_raw_half_queries requires resident_float16 dataset mode");
+        }
+        if (n_queries < 0) {
+            throw std::invalid_argument("n_queries cannot be negative");
+        }
+
+        validate_candidates(candidates_ptr, n_queries);
+
+        int next_slot = 0;
+        try {
+            for (int64_t start = 0; start < n_queries; start += batch_size_) {
+                if (host_slots_[next_slot].active) {
+                    synchronize_slot(next_slot, out_distances_ptr, out_neighbors_ptr);
+                }
+
+                const int64_t batch_queries = std::min(batch_size_, n_queries - start);
+                launch_batch_half_queries(next_slot, start, batch_queries, queries_ptr, candidates_ptr);
+                next_slot = 1 - next_slot;
+            }
+
+            synchronize_slot(0, out_distances_ptr, out_neighbors_ptr);
+            synchronize_slot(1, out_distances_ptr, out_neighbors_ptr);
+        } catch (...) {
+            synchronize_active_slots_no_merge();
+            throw;
+        }
+    }
+
     std::string mode() const
     {
         if (active_dataset_mode_ == ActiveDatasetMode::ResidentFloat16) {
@@ -880,6 +991,9 @@ private:
                 device_id);
 
             device_malloc(&slot.d_queries, query_values, "queries", device_id);
+            if (active_dataset_mode_ == ActiveDatasetMode::ResidentFloat16) {
+                device_malloc(&slot.d_queries_half, query_values, "half queries", device_id);
+            }
             device_malloc(&slot.d_candidates, candidate_values, "candidates", device_id);
             if (uses_staged_dataset()) {
                 device_malloc(
@@ -916,6 +1030,9 @@ private:
 
         for (auto& slot : host_slots_) {
             slot.queries.allocate(query_values);
+            if (active_dataset_mode_ == ActiveDatasetMode::ResidentFloat16) {
+                slot.queries_half.allocate(query_values);
+            }
             slot.candidates.allocate(candidate_values);
             slot.compact_rows.assign(devices_.size(), 0);
             slot.compact_datasets.reserve(devices_.size());
@@ -1157,6 +1274,124 @@ private:
         host_slot.active = true;
     }
 
+    void launch_batch_half_queries(
+        int slot_index,
+        int64_t start,
+        int64_t batch_queries,
+        const __half* queries_ptr,
+        const int64_t* candidates_ptr)
+    {
+        HostSlot& host_slot = host_slots_[slot_index];
+        host_slot.start = start;
+        host_slot.batch_queries = batch_queries;
+        host_slot.active = false;
+
+        const int64_t query_values = checked_mul(batch_queries, dim_, "half query values");
+        const int64_t candidate_values =
+            checked_mul(batch_queries, candidate_k_, "candidate values");
+        const int64_t output_values = checked_mul(batch_queries, final_k_, "output values");
+
+        std::memcpy(
+            host_slot.queries_half.data(),
+            queries_ptr + start * dim_,
+            checked_bytes(query_values, sizeof(__half), "half query copy"));
+        std::memcpy(
+            host_slot.candidates.data(),
+            candidates_ptr + start * candidate_k_,
+            checked_bytes(candidate_values, sizeof(int64_t), "candidate copy"));
+
+        for (size_t device_index = 0; device_index < devices_.size(); ++device_index) {
+            DeviceState& device = *devices_[device_index];
+            DeviceGuard guard(device.device_id);
+            SlotBuffers& slot = device.slots[slot_index];
+
+            {
+                ScopedNvtxRange range("session.rerank_h2d");
+                check_cuda_device(
+                    cudaMemcpyAsync(
+                        slot.d_queries_half,
+                        host_slot.queries_half.data(),
+                        checked_bytes(query_values, sizeof(__half), "half query H2D"),
+                        cudaMemcpyHostToDevice,
+                        slot.stream),
+                    "copy half queries to device",
+                    device.device_id);
+
+                check_cuda_device(
+                    cudaMemcpyAsync(
+                        slot.d_candidates,
+                        host_slot.candidates.data(),
+                        checked_bytes(candidate_values, sizeof(int64_t), "candidate H2D"),
+                        cudaMemcpyHostToDevice,
+                        slot.stream),
+                    "copy candidates to device",
+                    device.device_id);
+            }
+
+            {
+                ScopedNvtxRange range("session.rerank_kernel");
+                const dim3 distance_grid(
+                    static_cast<unsigned int>(candidate_k_),
+                    static_cast<unsigned int>(batch_queries));
+                compute_candidate_l2_half_query_half_dataset_kernel<<<
+                    distance_grid,
+                    kDistanceThreads,
+                    sizeof(float) * kDistanceThreads,
+                    slot.stream>>>(
+                    device.d_dataset_half,
+                    device.shard_start,
+                    device.shard_end,
+                    dim_,
+                    slot.d_queries_half,
+                    slot.d_candidates,
+                    candidate_k_,
+                    slot.d_candidate_distances);
+                check_cuda_device(
+                    cudaGetLastError(),
+                    "launch compute_candidate_l2_half_query_half_dataset_kernel",
+                    device.device_id);
+
+                select_local_topk_kernel<<<
+                    static_cast<unsigned int>(batch_queries),
+                    1,
+                    0,
+                    slot.stream>>>(
+                    slot.d_candidate_distances,
+                    slot.d_candidates,
+                    candidate_k_,
+                    final_k_,
+                    slot.d_partial_distances,
+                    slot.d_partial_rows);
+                check_cuda_device(cudaGetLastError(), "launch select_local_topk_kernel", device.device_id);
+            }
+
+            {
+                ScopedNvtxRange range("session.rerank_d2h");
+                check_cuda_device(
+                    cudaMemcpyAsync(
+                        host_slot.partial_distances[device_index].data(),
+                        slot.d_partial_distances,
+                        checked_bytes(output_values, sizeof(float), "partial distance D2H"),
+                        cudaMemcpyDeviceToHost,
+                        slot.stream),
+                    "copy partial distances to host",
+                    device.device_id);
+
+                check_cuda_device(
+                    cudaMemcpyAsync(
+                        host_slot.partial_rows[device_index].data(),
+                        slot.d_partial_rows,
+                        checked_bytes(output_values, sizeof(int64_t), "partial row D2H"),
+                        cudaMemcpyDeviceToHost,
+                        slot.stream),
+                    "copy partial rows to host",
+                    device.device_id);
+            }
+        }
+
+        host_slot.active = true;
+    }
+
     void synchronize_slot(
         int slot_index,
         float* out_distances_ptr,
@@ -1175,7 +1410,10 @@ private:
                 device->device_id);
         }
 
-        merge_slot(host_slot, out_distances_ptr, out_neighbors_ptr);
+        {
+            ScopedNvtxRange range("session.merge");
+            merge_slot(host_slot, out_distances_ptr, out_neighbors_ptr);
+        }
         host_slot.active = false;
     }
 
@@ -1267,6 +1505,246 @@ private:
     HostSlot host_slots_[2];
 };
 
+class IvfPqSearchRerankSession {
+public:
+    using IndexT =
+        cuvs::neighbors::mg_index<cuvs::neighbors::ivf_pq::index<int64_t>, half, int64_t>;
+
+    IvfPqSearchRerankSession(
+        py::array index_dataset,
+        py::array_t<float, py::array::c_style | py::array::forcecast> rerank_dataset,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> dataset_ids,
+        int64_t final_k,
+        int64_t candidate_k,
+        int64_t batch_size,
+        py::object device_ids,
+        int64_t n_lists,
+        int64_t pq_bits,
+        int64_t pq_dim,
+        int64_t n_probes)
+        : device_ids_(parse_device_ids(device_ids)),
+          clique_(device_ids_),
+          final_k_(final_k),
+          candidate_k_(candidate_k),
+          batch_size_(batch_size)
+    {
+        py::buffer_info index_info = index_dataset.request();
+        if (index_info.ndim != 2) {
+            throw std::invalid_argument("index_dataset must be 2D");
+        }
+        if (index_info.itemsize != sizeof(half)) {
+            throw std::invalid_argument(
+                "IvfPqSearchRerankSession currently requires float16 index_dataset");
+        }
+        if (rerank_dataset.ndim() != 2) {
+            throw std::invalid_argument("rerank_dataset must be 2D");
+        }
+        if (dataset_ids.ndim() != 1) {
+            throw std::invalid_argument("dataset_ids must be 1D");
+        }
+
+        n_rows_ = index_info.shape[0];
+        dim_ = index_info.shape[1];
+        if (n_rows_ <= 0 || dim_ <= 0) {
+            throw std::invalid_argument("index_dataset must have positive shape");
+        }
+        if (rerank_dataset.shape(0) != n_rows_ || rerank_dataset.shape(1) != dim_) {
+            throw std::invalid_argument("rerank_dataset shape must match index_dataset shape");
+        }
+        if (dataset_ids.shape(0) != n_rows_) {
+            throw std::invalid_argument("dataset_ids length must match dataset rows");
+        }
+        if (final_k_ <= 0 || candidate_k_ <= 0 || final_k_ > candidate_k_) {
+            throw std::invalid_argument("final_k and candidate_k must satisfy 0 < final_k <= candidate_k");
+        }
+
+        index_dataset_owner_ = index_dataset;
+
+        configure_search_params(n_probes);
+
+        auto index_params = make_index_params(n_lists, pq_bits, pq_dim);
+        const half* index_ptr = reinterpret_cast<const half*>(index_info.ptr);
+        auto index_view = raft::make_host_matrix_view<const half, int64_t, raft::row_major>(
+            index_ptr,
+            n_rows_,
+            dim_);
+
+        {
+            py::gil_scoped_release release;
+            auto built_index = cuvs::neighbors::ivf_pq::build(clique_, index_params, index_view);
+            index_ = std::make_unique<IndexT>(std::move(built_index));
+            sync_session_devices();
+        }
+
+        reranker_ = std::make_unique<MultiGpuExactReranker>(
+            rerank_dataset,
+            dataset_ids,
+            final_k_,
+            candidate_k_,
+            batch_size_,
+            py::cast(device_ids_),
+            "float16");
+    }
+
+    py::tuple search_rerank(py::array queries)
+    {
+        ScopedNvtxRange total_range("session.search_rerank");
+
+        py::buffer_info query_info = queries.request();
+        if (query_info.ndim != 2) {
+            throw std::invalid_argument("queries must be 2D");
+        }
+        if (query_info.itemsize != sizeof(half)) {
+            throw std::invalid_argument(
+                "IvfPqSearchRerankSession.search_rerank currently requires float16 queries");
+        }
+
+        const int64_t n_queries = query_info.shape[0];
+        const int64_t query_dim = query_info.shape[1];
+        if (query_dim != dim_) {
+            throw std::invalid_argument("queries dimension must match index dimension");
+        }
+
+        py::array_t<float> out_distances({n_queries, final_k_});
+        py::array_t<int64_t> out_neighbors({n_queries, final_k_});
+
+        const half* query_ptr = reinterpret_cast<const half*>(query_info.ptr);
+        float* out_distances_ptr = out_distances.mutable_data();
+        int64_t* out_neighbors_ptr = out_neighbors.mutable_data();
+
+        {
+            py::gil_scoped_release release;
+            ensure_search_buffers(n_queries);
+
+            {
+                ScopedNvtxRange search_range("session.search");
+                auto query_view = raft::make_host_matrix_view<const half, int64_t, raft::row_major>(
+                    query_ptr,
+                    n_queries,
+                    dim_);
+                auto neighbor_view = raft::make_host_matrix_view<int64_t, int64_t, raft::row_major>(
+                    search_neighbors_.data(),
+                    n_queries,
+                    candidate_k_);
+                auto distance_view = raft::make_host_matrix_view<float, int64_t, raft::row_major>(
+                    search_distances_.data(),
+                    n_queries,
+                    candidate_k_);
+
+                cuvs::neighbors::ivf_pq::search(
+                    clique_,
+                    *index_,
+                    search_params_,
+                    query_view,
+                    neighbor_view,
+                    distance_view);
+                sync_session_devices();
+            }
+
+            {
+                ScopedNvtxRange rerank_range("session.rerank");
+                reranker_->rerank_raw_half_queries(
+                    query_ptr,
+                    search_neighbors_.data(),
+                    n_queries,
+                    out_distances_ptr,
+                    out_neighbors_ptr);
+            }
+        }
+
+        return py::make_tuple(out_distances, out_neighbors);
+    }
+
+    void set_n_probes(int64_t n_probes)
+    {
+        if (n_probes <= 0) {
+            throw std::invalid_argument("n_probes must be positive");
+        }
+        search_params_.n_probes = static_cast<uint32_t>(n_probes);
+    }
+
+    std::string mode() const
+    {
+        return "cuvs_cpp_search_resident_float16_rerank";
+    }
+
+private:
+    static cuvs::neighbors::mg_index_params<cuvs::neighbors::ivf_pq::index_params>
+    make_index_params(int64_t n_lists, int64_t pq_bits, int64_t pq_dim)
+    {
+        if (n_lists <= 0 || pq_bits <= 0 || pq_dim <= 0) {
+            throw std::invalid_argument("n_lists, pq_bits, and pq_dim must be positive");
+        }
+
+        cuvs::neighbors::mg_index_params<cuvs::neighbors::ivf_pq::index_params> params;
+        params.mode = cuvs::neighbors::SHARDED;
+        params.metric = cuvs::distance::DistanceType::L2Expanded;
+        params.n_lists = static_cast<uint32_t>(n_lists);
+        params.pq_bits = static_cast<uint32_t>(pq_bits);
+        params.pq_dim = static_cast<uint32_t>(pq_dim);
+        params.kmeans_n_iters = 20;
+        params.kmeans_trainset_fraction = 0.5;
+        params.codebook_kind = cuvs::neighbors::ivf_pq::codebook_gen::PER_SUBSPACE;
+        params.codes_layout = cuvs::neighbors::ivf_pq::list_layout::INTERLEAVED;
+        params.force_random_rotation = false;
+        params.conservative_memory_allocation = true;
+        params.max_train_points_per_pq_code = 256;
+        return params;
+    }
+
+    void configure_search_params(int64_t n_probes)
+    {
+        if (n_probes <= 0) {
+            throw std::invalid_argument("n_probes must be positive");
+        }
+        search_params_.n_probes = static_cast<uint32_t>(n_probes);
+        search_params_.search_mode = cuvs::neighbors::LOAD_BALANCER;
+        search_params_.merge_mode = cuvs::neighbors::MERGE_ON_ROOT_RANK;
+        search_params_.n_rows_per_batch = 1000;
+        search_params_.lut_dtype = CUDA_R_16F;
+        search_params_.internal_distance_dtype = CUDA_R_16F;
+        search_params_.coarse_search_dtype = CUDA_R_16F;
+        search_params_.max_internal_batch_size = 4096;
+    }
+
+    void ensure_search_buffers(int64_t n_queries)
+    {
+        if (n_queries <= search_buffer_capacity_queries_) {
+            return;
+        }
+        const int64_t values = checked_mul(n_queries, candidate_k_, "session search output");
+        search_neighbors_.allocate(values);
+        search_distances_.allocate(values);
+        search_buffer_capacity_queries_ = n_queries;
+    }
+
+    void sync_session_devices() const
+    {
+        int previous_device = 0;
+        check_cuda(cudaGetDevice(&previous_device), "cudaGetDevice");
+        for (int device_id : device_ids_) {
+            check_cuda(cudaSetDevice(device_id), "cudaSetDevice");
+            check_cuda_device(cudaDeviceSynchronize(), "sync session device", device_id);
+        }
+        check_cuda(cudaSetDevice(previous_device), "cudaSetDevice");
+    }
+
+    std::vector<int> device_ids_;
+    raft::device_resources_snmg clique_;
+    int64_t n_rows_ = 0;
+    int64_t dim_ = 0;
+    int64_t final_k_ = 0;
+    int64_t candidate_k_ = 0;
+    int64_t batch_size_ = 0;
+    int64_t search_buffer_capacity_queries_ = 0;
+    py::array index_dataset_owner_;
+    cuvs::neighbors::mg_search_params<cuvs::neighbors::ivf_pq::search_params> search_params_;
+    std::unique_ptr<IndexT> index_;
+    std::unique_ptr<MultiGpuExactReranker> reranker_;
+    PinnedBuffer<int64_t> search_neighbors_;
+    PinnedBuffer<float> search_distances_;
+};
+
 py::tuple rerank_ivf_pq_candidates_exact_l2_gpu(
     py::array_t<float, py::array::c_style | py::array::forcecast> dataset,
     py::array_t<int64_t, py::array::c_style | py::array::forcecast> dataset_ids,
@@ -1320,6 +1798,35 @@ PYBIND11_MODULE(ivfpq_gpu_rerank, m)
             py::arg("storage_dtype") = "float32")
         .def_property_readonly("mode", &MultiGpuExactReranker::mode)
         .def("rerank", &MultiGpuExactReranker::rerank, py::arg("queries"), py::arg("candidate_neighbors"));
+
+    py::class_<IvfPqSearchRerankSession>(m, "IvfPqSearchRerankSession")
+        .def(
+            py::init<
+                py::array,
+                py::array_t<float, py::array::c_style | py::array::forcecast>,
+                py::array_t<int64_t, py::array::c_style | py::array::forcecast>,
+                int64_t,
+                int64_t,
+                int64_t,
+                py::object,
+                int64_t,
+                int64_t,
+                int64_t,
+                int64_t>(),
+            py::arg("index_dataset"),
+            py::arg("rerank_dataset"),
+            py::arg("dataset_ids"),
+            py::arg("final_k"),
+            py::arg("candidate_k"),
+            py::arg("batch_size") = 512,
+            py::arg("device_ids") = py::none(),
+            py::arg("n_lists") = 4096,
+            py::arg("pq_bits") = 4,
+            py::arg("pq_dim") = 384,
+            py::arg("n_probes") = 32)
+        .def_property_readonly("mode", &IvfPqSearchRerankSession::mode)
+        .def("set_n_probes", &IvfPqSearchRerankSession::set_n_probes, py::arg("n_probes"))
+        .def("search_rerank", &IvfPqSearchRerankSession::search_rerank, py::arg("queries"));
 
     m.def(
         "rerank_ivf_pq_candidates_exact_l2_gpu",

@@ -32,6 +32,7 @@ def main():
         "-Xcompiler=-fPIC",
         *pybind11_includes,
         f"-I{conda_prefix / 'include'}",
+        f"-I{conda_prefix / 'include' / 'rapids'}",
         str(source_path),
         "-o",
         str(output_path),

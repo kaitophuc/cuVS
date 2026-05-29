@@ -1,5 +1,6 @@
 import csv
 import gc
+import time
 import numpy as np
 
 import nvtx
@@ -27,6 +28,7 @@ from config import (
     IVFPQ_RERANK_BACKEND,
     IVFPQ_RERANK_BATCH_SIZE,
     IVFPQ_RERANK_CANDIDATE_K,
+    IVFPQ_RERANK_DEVICE_IDS,
     IVFPQ_RERANK_STORAGE_DTYPE,
     RESULTS_DIR,
 )
@@ -41,9 +43,10 @@ from multi_gpu_ivf_pq import (
 )
 from rerank import (
     create_exact_reranker,
+    create_ivfpq_search_rerank_session,
     rerank_ivf_pq_candidates_exact_l2,
 )
-from timing_utils import measure_synchronized_wall_time
+from timing_utils import measure_synchronized_wall_time, sync_all_cuda_devices
 
 def drop_timing_result(summary):
     result = summary.pop("result", None)
@@ -144,8 +147,9 @@ def run_ivf_pq_sweep_benchmark():
     dataset = dataset.astype(dtype_from_config(IVFPQ_DATASET_DTYPE), copy=False)
     queries = queries.astype(dtype_from_config(IVFPQ_QUERY_DTYPE), copy=False)
 
-    resources = create_multi_gpu_resources()
-    sync_fn = resources.sync
+    use_session_backend = IVFPQ_ENABLE_EXACT_RERANK and IVFPQ_RERANK_BACKEND == "session"
+    resources = None if use_session_backend else create_multi_gpu_resources()
+    sync_fn = sync_all_cuda_devices if use_session_backend else resources.sync
 
     benchmark_queries = queries[:OFFLINE_QUERY_COUNT]
     online_queries = queries[:ONLINE_QUERY_COUNT]
@@ -157,6 +161,9 @@ def run_ivf_pq_sweep_benchmark():
     print("Queries shape:", benchmark_queries.shape)
     print("IVF-PQ queries dtype:", benchmark_queries.dtype)
     print("k:", K)
+    if IVFPQ_ENABLE_EXACT_RERANK:
+        print("rerank backend:", IVFPQ_RERANK_BACKEND)
+        print("rerank storage dtype:", IVFPQ_RERANK_STORAGE_DTYPE)
     print("n_lists sweep:", IVFPQ_N_LISTS_SWEEP)
     print("pq_bits sweep:", IVFPQ_PQ_BITS_SWEEP)
     print("pq_dim sweep:", IVFPQ_PQ_DIM_SWEEP)
@@ -170,28 +177,57 @@ def run_ivf_pq_sweep_benchmark():
     for n_lists in IVFPQ_N_LISTS_SWEEP:
         for pq_bits in IVFPQ_PQ_BITS_SWEEP:
             for pq_dim in IVFPQ_PQ_DIM_SWEEP:
-                index_params = create_index_params(
-                    n_lists=n_lists,
-                    pq_bits=pq_bits,
-                    pq_dim=pq_dim
-                )
+                index = None
+                session = None
+                reranker = None
+                index_params = None
+                if not use_session_backend:
+                    index_params = create_index_params(
+                        n_lists=n_lists,
+                        pq_bits=pq_bits,
+                        pq_dim=pq_dim
+                    )
 
                 print(
                     f"\nBuilding IVF-PQ index with "
                     f"n_lists={n_lists}, pq_bits={pq_bits}, pq_dim={pq_dim}..."
                 )
 
-                index, build_time = build_ivf_pq_index(
-                    dataset,
-                    index_params,
-                    resources=resources,
-                    sync_fn=sync_fn,
-                    print_info=False,
-                )
+                if use_session_backend:
+                    sync_fn()
+                    build_start = time.perf_counter()
+                    session = create_ivfpq_search_rerank_session(
+                        index_dataset=dataset,
+                        rerank_dataset=rerank_dataset,
+                        dataset_ids=dataset_ids,
+                        final_k=K,
+                        candidate_k=IVFPQ_RERANK_CANDIDATE_K,
+                        batch_size=IVFPQ_RERANK_BATCH_SIZE,
+                        device_ids=IVFPQ_RERANK_DEVICE_IDS,
+                        n_lists=n_lists,
+                        pq_bits=pq_bits,
+                        pq_dim=pq_dim,
+                        n_probes=IVFPQ_N_PROBES_SWEEP[0],
+                        storage_dtype=IVFPQ_RERANK_STORAGE_DTYPE,
+                    )
+                    sync_fn()
+                    build_time = time.perf_counter() - build_start
+                    print(f"Session mode: {getattr(session, 'mode', 'unknown')}")
+                else:
+                    index, build_time = build_ivf_pq_index(
+                        dataset,
+                        index_params,
+                        resources=resources,
+                        sync_fn=sync_fn,
+                        print_info=False,
+                    )
                 print(f"IVF-PQ index built in {build_time:.2f} seconds")
 
-                reranker = None
-                if IVFPQ_ENABLE_EXACT_RERANK and IVFPQ_RERANK_BACKEND == "multi_gpu":
+                if (
+                    not use_session_backend
+                    and IVFPQ_ENABLE_EXACT_RERANK
+                    and IVFPQ_RERANK_BACKEND == "multi_gpu"
+                ):
                     print(
                         "Creating multi-GPU exact reranker "
                         f"(storage={IVFPQ_RERANK_STORAGE_DTYPE})..."
@@ -209,7 +245,11 @@ def run_ivf_pq_sweep_benchmark():
                 try:
                     for n_probes in IVFPQ_N_PROBES_SWEEP:
                         config_number += 1
-                        search_params = create_search_params(n_probes)
+                        if use_session_backend:
+                            session.set_n_probes(n_probes)
+                            search_params = None
+                        else:
+                            search_params = create_search_params(n_probes)
 
                         print(
                             f"\n[{config_number}/{total_configs}] "
@@ -223,8 +263,10 @@ def run_ivf_pq_sweep_benchmark():
                             color="green",
                         )
                         try:
-                            offline_summary = measure_synchronized_wall_time(
-                                lambda: search_ivf_pq_with_optional_rerank(
+                            if use_session_backend:
+                                offline_fn = lambda: session.search_rerank(benchmark_queries)
+                            else:
+                                offline_fn = lambda: search_ivf_pq_with_optional_rerank(
                                     index,
                                     benchmark_queries,
                                     search_params,
@@ -232,7 +274,10 @@ def run_ivf_pq_sweep_benchmark():
                                     rerank_dataset,
                                     dataset_ids,
                                     reranker,
-                                ),
+                                )
+
+                            offline_summary = measure_synchronized_wall_time(
+                                offline_fn,
                                 warmup_runs=SEARCH_WARMUP_RUNS,
                                 timed_runs=SEARCH_TIMED_RUNS,
                                 sync_fn=sync_fn,
@@ -248,8 +293,10 @@ def run_ivf_pq_sweep_benchmark():
                         print("First query top 10 neighbors:", neighbors[0, :DISPLAY_TOP_K])
                         print("First query top 10 distances:", distances[0, :DISPLAY_TOP_K])
 
-                        online_summary = measure_synchronized_wall_time(
-                            lambda: search_ivf_pq_with_optional_rerank(
+                        if use_session_backend:
+                            online_fn = lambda: session.search_rerank(online_queries)
+                        else:
+                            online_fn = lambda: search_ivf_pq_with_optional_rerank(
                                 index,
                                 online_queries,
                                 search_params,
@@ -257,7 +304,10 @@ def run_ivf_pq_sweep_benchmark():
                                 rerank_dataset,
                                 dataset_ids,
                                 reranker,
-                            ),
+                            )
+
+                        online_summary = measure_synchronized_wall_time(
+                            online_fn,
                             warmup_runs=SEARCH_WARMUP_RUNS,
                             timed_runs=SEARCH_TIMED_RUNS,
                             sync_fn=sync_fn,
@@ -314,6 +364,7 @@ def run_ivf_pq_sweep_benchmark():
 
                 finally:
                     sync_fn()
+                    del session
                     del reranker
                     del index
                     gc.collect()
