@@ -97,6 +97,41 @@ def main():
     np.testing.assert_allclose(actual_distances, expected_distances, rtol=1e-5, atol=1e-5)
     np.testing.assert_array_equal(actual_neighbors, expected_neighbors)
 
+    try:
+        fp16_reranker = create_exact_reranker(
+            gpu_dataset,
+            dataset_ids,
+            final_k=2,
+            candidate_k=candidates.shape[1],
+            batch_size=2,
+            storage_dtype="float16",
+        )
+    except Exception as exc:
+        print(f"Resident fp16 rerank smoke test skipped: {exc}")
+    else:
+        if fp16_reranker.mode != "resident_float16":
+            raise AssertionError(
+                f"expected resident_float16 mode, got {fp16_reranker.mode!r}"
+            )
+
+        fp16_distances, fp16_neighbors = fp16_reranker.rerank(gpu_queries, candidates)
+        np.testing.assert_allclose(
+            fp16_distances,
+            expected_distances,
+            rtol=1e-3,
+            atol=1e-3,
+        )
+        np.testing.assert_array_equal(fp16_neighbors, expected_neighbors)
+
+        invalid_candidates = candidates.copy()
+        invalid_candidates[0, 0] = gpu_dataset.shape[0]
+        try:
+            fp16_reranker.rerank(gpu_queries, invalid_candidates)
+            raise AssertionError("invalid candidate row did not raise")
+        except Exception as exc:
+            if "invalid dataset row index" not in str(exc):
+                raise
+
     invalid_candidates = candidates.copy()
     invalid_candidates[0, 0] = gpu_dataset.shape[0]
     try:

@@ -4,8 +4,8 @@ import config
 def main():
     """Run the current best single IVF-PQ configuration."""
     config.IVFPQ_N_LISTS_SWEEP = [4096]
-    config.IVFPQ_PQ_BITS_SWEEP = [8]
-    config.IVFPQ_PQ_DIM_SWEEP = [768]
+    config.IVFPQ_PQ_BITS_SWEEP = [4]
+    config.IVFPQ_PQ_DIM_SWEEP = [384]
     config.IVFPQ_N_PROBES_SWEEP = [32]
 
     # Import after overriding config because sweep_ivfpq_benchmark imports

@@ -92,6 +92,7 @@ IVFPQ_RERANK_BATCH_SIZE = int(os.environ.get("CUVS_BENCH_IVFPQ_RERANK_BATCH_SIZE
 IVFPQ_RERANK_BACKEND = os.environ.get("CUVS_BENCH_IVFPQ_RERANK_BACKEND", "multi_gpu")
 IVFPQ_RERANK_DEVICE_ID = int(os.environ.get("CUVS_BENCH_IVFPQ_RERANK_DEVICE_ID", "0"))
 IVFPQ_RERANK_DEVICE_IDS = _parse_optional_int_list_env("CUVS_BENCH_IVFPQ_RERANK_DEVICE_IDS")
+IVFPQ_RERANK_STORAGE_DTYPE = os.environ.get("CUVS_BENCH_IVFPQ_RERANK_STORAGE_DTYPE", "float32")
 
 # IVF-PQ input/search precision. Lower precision can improve speed/memory use,
 # but it can also move nearest-neighbor rankings and change recall.

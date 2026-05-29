@@ -27,6 +27,7 @@ from config import (
     IVFPQ_RERANK_BACKEND,
     IVFPQ_RERANK_BATCH_SIZE,
     IVFPQ_RERANK_CANDIDATE_K,
+    IVFPQ_RERANK_STORAGE_DTYPE,
     RESULTS_DIR,
 )
 from load_data import load_default_data
@@ -191,13 +192,17 @@ def run_ivf_pq_sweep_benchmark():
 
                 reranker = None
                 if IVFPQ_ENABLE_EXACT_RERANK and IVFPQ_RERANK_BACKEND == "multi_gpu":
-                    print("Creating multi-GPU exact reranker...")
+                    print(
+                        "Creating multi-GPU exact reranker "
+                        f"(storage={IVFPQ_RERANK_STORAGE_DTYPE})..."
+                    )
                     reranker = create_exact_reranker(
                         dataset=rerank_dataset,
                         dataset_ids=dataset_ids,
                         final_k=K,
                         candidate_k=IVFPQ_RERANK_CANDIDATE_K,
                         batch_size=IVFPQ_RERANK_BATCH_SIZE,
+                        storage_dtype=IVFPQ_RERANK_STORAGE_DTYPE,
                     )
                     print(f"Exact reranker mode: {getattr(reranker, 'mode', 'unknown')}")
 

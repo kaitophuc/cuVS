@@ -5,10 +5,12 @@ from config import (
     IVFPQ_RERANK_BATCH_SIZE,
     IVFPQ_RERANK_DEVICE_ID,
     IVFPQ_RERANK_DEVICE_IDS,
+    IVFPQ_RERANK_STORAGE_DTYPE,
 )
 
 
 SUPPORTED_RERANK_BACKENDS = {"multi_gpu", "gpu", "cpu"}
+SUPPORTED_RERANK_STORAGE_DTYPES = {"float32", "float16"}
 
 _single_gpu_rerank_fn = None
 _multi_gpu_reranker_cls = None
@@ -53,8 +55,15 @@ def create_exact_reranker(
     candidate_k,
     batch_size=IVFPQ_RERANK_BATCH_SIZE,
     device_ids=IVFPQ_RERANK_DEVICE_IDS,
+    storage_dtype=IVFPQ_RERANK_STORAGE_DTYPE,
 ):
     """Create a stateful CUDA exact reranker that reuses GPU buffers across calls."""
+    if storage_dtype not in SUPPORTED_RERANK_STORAGE_DTYPES:
+        expected = ", ".join(sorted(SUPPORTED_RERANK_STORAGE_DTYPES))
+        raise ValueError(
+            f"Unsupported rerank storage_dtype={storage_dtype!r}; expected one of: {expected}"
+        )
+
     reranker_cls = _load_multi_gpu_reranker_cls()
     return reranker_cls(
         _as_float32(dataset),
@@ -63,6 +72,7 @@ def create_exact_reranker(
         candidate_k,
         batch_size,
         device_ids,
+        storage_dtype,
     )
 
 
