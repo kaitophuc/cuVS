@@ -1745,34 +1745,6 @@ private:
     PinnedBuffer<float> search_distances_;
 };
 
-py::tuple rerank_ivf_pq_candidates_exact_l2_gpu(
-    py::array_t<float, py::array::c_style | py::array::forcecast> dataset,
-    py::array_t<int64_t, py::array::c_style | py::array::forcecast> dataset_ids,
-    py::array_t<float, py::array::c_style | py::array::forcecast> queries,
-    py::array_t<int64_t, py::array::c_style | py::array::forcecast> candidate_neighbors,
-    int64_t final_k,
-    int64_t batch_size,
-    int device_id)
-{
-    if (candidate_neighbors.ndim() != 2) {
-        throw std::invalid_argument("candidate_neighbors must be 2D");
-    }
-
-    py::list device_ids;
-    device_ids.append(device_id);
-
-    MultiGpuExactReranker reranker(
-        dataset,
-        dataset_ids,
-        final_k,
-        candidate_neighbors.shape(1),
-        batch_size,
-        device_ids,
-        "float32");
-
-    return reranker.rerank(queries, candidate_neighbors);
-}
-
 }  // namespace
 
 PYBIND11_MODULE(ivfpq_gpu_rerank, m)
@@ -1795,7 +1767,7 @@ PYBIND11_MODULE(ivfpq_gpu_rerank, m)
             py::arg("candidate_k"),
             py::arg("batch_size") = 512,
             py::arg("device_ids") = py::none(),
-            py::arg("storage_dtype") = "float32")
+            py::arg("storage_dtype") = "float16")
         .def_property_readonly("mode", &MultiGpuExactReranker::mode)
         .def("rerank", &MultiGpuExactReranker::rerank, py::arg("queries"), py::arg("candidate_neighbors"));
 
@@ -1828,14 +1800,4 @@ PYBIND11_MODULE(ivfpq_gpu_rerank, m)
         .def("set_n_probes", &IvfPqSearchRerankSession::set_n_probes, py::arg("n_probes"))
         .def("search_rerank", &IvfPqSearchRerankSession::search_rerank, py::arg("queries"));
 
-    m.def(
-        "rerank_ivf_pq_candidates_exact_l2_gpu",
-        &rerank_ivf_pq_candidates_exact_l2_gpu,
-        py::arg("dataset"),
-        py::arg("dataset_ids"),
-        py::arg("queries"),
-        py::arg("candidate_neighbors"),
-        py::arg("final_k"),
-        py::arg("batch_size") = 512,
-        py::arg("device_id") = 0);
 }

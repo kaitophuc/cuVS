@@ -6,7 +6,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from recall import calculate_recall_at_k
+from support.metrics import calculate_recall_at_k
 
 
 class RecallTests(unittest.TestCase):

@@ -4,15 +4,15 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
+
 from config import (
-    DATA_DIR,
-    DISPLAY_TOP_K,
     EMBEDDING_COLUMN,
     GROUND_TRUTH_BATCH_SIZE,
     GROUND_TRUTH_CACHE_DIR,
     GROUND_TRUTH_TOP_K,
     ID_COLUMN,
     METRIC,
+    PRECOMPUTED_NEIGHBORS_PATH,
     PROJECT_ROOT,
     QUERY_LIMIT,
     QUERY_PATH,
@@ -20,7 +20,6 @@ from config import (
     VECTOR_DIM,
 )
 
-PRECOMPUTED_NEIGHBORS_PATH = DATA_DIR / "neighbors.parquet"
 PRECOMPUTED_NEIGHBORS_ID_COLUMN = "id"
 PRECOMPUTED_NEIGHBORS_COLUMN = "neighbors_id"
 FULL_DATASET_ROW_COUNT = 5_000_000
@@ -132,7 +131,14 @@ def load_precomputed_ground_truth(top_k=GROUND_TRUTH_TOP_K, query_limit=QUERY_LI
     return distances, neighbors
 
 
-def compute_exact_ground_truth(dataset, dataset_ids, queries, top_k = GROUND_TRUTH_TOP_K, query_limit = QUERY_LIMIT, batch_size = GROUND_TRUTH_BATCH_SIZE):
+def compute_exact_ground_truth(
+    dataset,
+    dataset_ids,
+    queries,
+    top_k=GROUND_TRUTH_TOP_K,
+    query_limit=QUERY_LIMIT,
+    batch_size=GROUND_TRUTH_BATCH_SIZE,
+):
     """Compute exact nearest neighbors with batched squared L2 distance."""
     queries_subset = queries[:query_limit]
 
@@ -145,7 +151,7 @@ def compute_exact_ground_truth(dataset, dataset_ids, queries, top_k = GROUND_TRU
         end = min(start + batch_size, query_limit)
         query_batch = queries_subset[start:end]
 
-        query_norms = np.sum(query_batch * query_batch, axis = 1)
+        query_norms = np.sum(query_batch * query_batch, axis=1)
 
         distances = (
             query_norms[:, None] + dataset_norms[None, :] - 2.0 * query_batch @ dataset.T
@@ -242,27 +248,3 @@ def get_or_compute_exact_ground_truth(
     save_ground_truth_cache(cache_path, distances, neighbors, metadata)
 
     return distances, neighbors
-
-
-def main():
-    from load_data import load_default_data
-
-    dataset_ids, dataset, _, queries = load_default_data(print_info=True)
-
-    gt_distances, gt_neighbors = get_or_compute_exact_ground_truth(
-        dataset=dataset,
-        dataset_ids=dataset_ids,
-        queries=queries,
-        top_k=GROUND_TRUTH_TOP_K,
-        query_limit=QUERY_LIMIT,
-        batch_size=GROUND_TRUTH_BATCH_SIZE,
-        print_info=True,
-    )
-
-    print("Ground truth distances shape:", gt_distances.shape)
-    print("Ground truth neighbors shape:", gt_neighbors.shape)
-    print("First query top 10 neighbors:", gt_neighbors[0, :DISPLAY_TOP_K])
-    print("First query top 10 distances:", gt_distances[0, :DISPLAY_TOP_K])
-
-if __name__ == "__main__":
-    main()

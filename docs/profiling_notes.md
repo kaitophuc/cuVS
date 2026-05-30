@@ -1,9 +1,14 @@
 # Profiling Notes
 
-These notes collect the commands used while profiling the multi-GPU IVF-PQ benchmark.
+These notes collect the profiling commands used for the optimized IVF-PQ benchmark.
 
-Relevant cuVS multi-GPU documentation:
-https://docs.rapids.ai/api/cuvs/stable/c_api/neighbors_mg/#multi-gpu-cagra
+## Main Command
+
+```bash
+python src/run_ivf_pq_optimized.py
+```
+
+The optimized settings live in `src/config.py` under `IVFPQ_OPTIMIZED_PARAMS`.
 
 ## Nsight Systems
 
@@ -18,42 +23,32 @@ nsys profile \
   --cpuctxsw=process-tree \
   --stats=true \
   --force-overwrite=true \
-  -o profiles/nsys_ivfpq_2048_8_1536_32 \
+  -o profiles/nsys_ivfpq_optimized \
   python src/run_ivf_pq_optimized.py
 ```
 
-## Current Analysis Focus
+Useful things to inspect:
 
-The main profiling question is how much time is spent in:
-
-- IVF-PQ candidate search on the GPUs.
-- Exact squared-L2 reranking and rerank data movement.
-- Data movement between host memory and GPU memory.
-- Result merging across GPUs.
-
-The current optimized entrypoint is:
-
-```bash
-python src/run_ivf_pq_optimized.py
-```
+- IVF-PQ candidate search time.
+- Exact rerank kernel time.
+- Host/device copies around rerank.
+- Multi-GPU result merging.
 
 ## Rebuild CUDA Rerank Extension
 
-The optimized exact rerank backend is built from `src/rerank/cuda/ivfpq_gpu_rerank.cu`.
-The compiled extension is written to `src/rerank/extensions/`.
-
 ```bash
-/home/phuc/Work/cuVS/.conda/bin/python src/rerank/build_extension.py
+python src/ivf_pq/rerank/build_extension.py
 ```
 
-The reranker uses resident GPU dataset shards when memory allows. On smaller GPUs it
-automatically falls back to staged mode, which keeps reusable CUDA buffers and pinned
-host staging while packing only the candidates owned by each GPU.
+The extension writes to `src/ivf_pq/rerank/extensions/`. The default benchmark uses the
+C++ session backend, which runs cuVS IVF-PQ search and resident float16 exact rerank in
+one extension path.
 
-Run the optimized multi-GPU rerank benchmark with:
+## Device Selection
+
+Use the same multi-GPU backend for one or more devices:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-CUVS_BENCH_IVFPQ_RERANK_BACKEND=multi_gpu \
-/home/phuc/Work/cuVS/.conda/bin/python src/run_ivf_pq_optimized.py
+CUVS_BENCH_IVFPQ_RERANK_DEVICE_IDS=0,1 \
+python src/run_ivf_pq_optimized.py
 ```

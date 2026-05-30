@@ -3,16 +3,13 @@ import numpy as np
 from config import (
     IVFPQ_RERANK_BACKEND,
     IVFPQ_RERANK_BATCH_SIZE,
-    IVFPQ_RERANK_DEVICE_ID,
     IVFPQ_RERANK_DEVICE_IDS,
     IVFPQ_RERANK_STORAGE_DTYPE,
 )
 
-
-SUPPORTED_RERANK_BACKENDS = {"session", "multi_gpu", "gpu", "cpu"}
+SUPPORTED_RERANK_BACKENDS = {"session", "multi_gpu", "cpu"}
 SUPPORTED_RERANK_STORAGE_DTYPES = {"float32", "float16"}
 
-_single_gpu_rerank_fn = None
 _multi_gpu_reranker_cls = None
 _search_rerank_session_cls = None
 
@@ -25,24 +22,11 @@ def _as_int64(array):
     return np.asarray(array, dtype=np.int64)
 
 
-def _load_single_gpu_rerank_fn():
-    global _single_gpu_rerank_fn
-
-    if _single_gpu_rerank_fn is None:
-        from rerank.extensions.ivfpq_gpu_rerank import (
-            rerank_ivf_pq_candidates_exact_l2_gpu,
-        )
-
-        _single_gpu_rerank_fn = rerank_ivf_pq_candidates_exact_l2_gpu
-
-    return _single_gpu_rerank_fn
-
-
 def _load_multi_gpu_reranker_cls():
     global _multi_gpu_reranker_cls
 
     if _multi_gpu_reranker_cls is None:
-        from rerank.extensions.ivfpq_gpu_rerank import MultiGpuExactReranker
+        from ivf_pq.rerank.extensions.ivfpq_gpu_rerank import MultiGpuExactReranker
 
         _multi_gpu_reranker_cls = MultiGpuExactReranker
 
@@ -53,7 +37,7 @@ def _load_search_rerank_session_cls():
     global _search_rerank_session_cls
 
     if _search_rerank_session_cls is None:
-        from rerank.extensions.ivfpq_gpu_rerank import IvfPqSearchRerankSession
+        from ivf_pq.rerank.extensions.ivfpq_gpu_rerank import IvfPqSearchRerankSession
 
         _search_rerank_session_cls = IvfPqSearchRerankSession
 
@@ -122,28 +106,6 @@ def create_ivfpq_search_rerank_session(
         pq_bits,
         pq_dim,
         n_probes,
-    )
-
-
-def rerank_ivf_pq_candidates_exact_l2_gpu(
-    dataset,
-    dataset_ids,
-    queries,
-    candidate_neighbors,
-    final_k,
-    batch_size=IVFPQ_RERANK_BATCH_SIZE,
-    device_id=IVFPQ_RERANK_DEVICE_ID,
-):
-    """Rerank IVF-PQ candidate ids with exact squared L2 using one CUDA device."""
-    rerank_fn = _load_single_gpu_rerank_fn()
-    return rerank_fn(
-        _as_float32(dataset),
-        _as_int64(dataset_ids),
-        _as_float32(queries),
-        _as_int64(candidate_neighbors),
-        final_k,
-        batch_size,
-        device_id,
     )
 
 
@@ -243,16 +205,6 @@ def rerank_ivf_pq_candidates_exact_l2(
             reranker=reranker,
             queries=queries,
             candidate_neighbors=candidate_neighbors,
-        )
-
-    if backend == "gpu":
-        return rerank_ivf_pq_candidates_exact_l2_gpu(
-            dataset=dataset,
-            dataset_ids=dataset_ids,
-            queries=queries,
-            candidate_neighbors=candidate_neighbors,
-            final_k=final_k,
-            batch_size=batch_size,
         )
 
     if backend == "cpu":

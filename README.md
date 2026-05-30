@@ -1,8 +1,8 @@
 # cuVS Multi-GPU ANN Benchmarks
 
-This repository contains Python benchmarks for approximate nearest-neighbor search with
-RAPIDS cuVS multi-GPU indexes. The current focus is comparing IVF-Flat and IVF-PQ on a
-5M-vector OpenAI embedding dataset with 1536-dimensional vectors and squared L2 distance.
+This project benchmarks multi-GPU approximate nearest-neighbor search with RAPIDS cuVS.
+The main focus is IVF-PQ on the 5M OpenAI embedding dataset, with IVF-Flat kept as a
+comparison baseline for sweeps and report charts.
 
 ## Current Baseline
 
@@ -10,187 +10,154 @@ RAPIDS cuVS multi-GPU indexes. The current focus is comparing IVF-Flat and IVF-P
 - Database size: 5,000,000 vectors when all 10 training shards are present
 - Query set: 1,000 vectors from `test.parquet`
 - Metric: squared L2 / `sqeuclidean`
-- Hardware used for the latest local runs: 2 x RTX 5070 Ti, 16 GB each
-- Best tracked IVF-PQ run: see `results/ivfpq_sweep_results.csv`
+- Main run: `python src/run_ivf_pq_optimized.py`
+- Expected optimized result on the current local setup: about `0.93` Recall@10 and
+  roughly `120k` QPS with the fused C++ session backend
 
 ## Repository Layout
 
 ```text
 src/
-  config.py                  Shared benchmark configuration
-  load_data.py               Parquet loading and NumPy cache handling
-  ground_truth.py            Exact/precomputed ground-truth loading
-  recall.py                  Recall@k calculation
-  multi_gpu_ivf_flat.py      Multi-GPU IVF-Flat wrappers
-  multi_gpu_ivf_pq.py        Multi-GPU IVF-PQ wrappers
-  rerank/
-    ivfpq.py                 Exact IVF-PQ rerank backends
-    cuda/                    CUDA source for GPU exact rerank
-    extensions/              Compiled rerank extension output
-    build_extension.py       Build helper for the CUDA rerank extension
-  multi_gpu_cagra.py         Multi-GPU CAGRA wrappers
-  benchmark.py               Single IVF-Flat benchmark
-  sweep_benchmark.py         IVF-Flat parameter sweep
-  sweep_ivfpq_benchmark.py   IVF-PQ parameter sweep
-  run_ivf_pq_optimized.py    Current best single IVF-PQ run
-  smoke_test.py              Tiny correctness checks for recall and optional GPU rerank
-docs/
-  profiling_notes.md         Nsight profiling commands and analysis notes
-results/
-  ivfpq_sweep_results.csv    Small tracked CSV summary from the latest run
-tests/
-  test_recall.py             Lightweight unit test for Recall@k
+  config.py                 Shared paths, benchmark settings, and tuned parameters
+  run_ivf_pq_optimized.py   Current best single IVF-PQ run
+  sweep_ivf_flat.py         IVF-Flat sweep entrypoint
+  sweep_ivf_pq.py           IVF-PQ sweep entrypoint
+  draw_charts.py            Regenerate charts from existing CSV files
+  support/                  Data loading, ground truth, metrics, timing, chart helpers
+  ivf_flat/                 IVF-Flat index helpers and sweep code
+  ivf_pq/                   IVF-PQ index helpers, benchmark flow, sweep code
+    rerank/                 Exact rerank wrapper and CUDA extension source
+tests/                      Recall unit test and CUDA rerank smoke test
+docs/                       Profiling notes
+results/                    Small tracked result examples and generated charts
 ```
 
-Large generated folders are intentionally not tracked: `.conda/`, `openai_large_5m/`,
+Large generated folders are intentionally ignored: `.conda/`, `openai_large_5m/`,
 `data_cache/`, `ground_truth_cache/`, `profiles/`, and `logs/`.
 
 ## Environment Setup
-
-Create the conda environment:
 
 ```bash
 conda env create -f environment.yml
 conda activate cuvs-mgpu-benchmark
 ```
 
-The local environment used for the latest verification had these important versions:
+The local environment used for verification includes Python 3.12, cuVS 26.04, RMM 26.04,
+cuda-python 12.9, NumPy 2.4, PyArrow 24, Matplotlib, Ruff, Black, and `nvtx`.
 
-- Python 3.12.13
-- cuVS 26.04.00
-- RMM 26.04.00
-- cuda-python 12.9.6
-- NumPy 2.4.3
-- PyArrow 24.0.0
-- nvtx 0.2.15
+## Dataset
 
-## Full Dataset Guide
-
-By default, the benchmark expects the full dataset under:
+By default, the benchmark expects:
 
 ```text
 openai_large_5m/
   train-00-of-10.parquet
-  train-01-of-10.parquet
-  train-02-of-10.parquet
-  train-03-of-10.parquet
-  train-04-of-10.parquet
-  train-05-of-10.parquet
-  train-06-of-10.parquet
-  train-07-of-10.parquet
-  train-08-of-10.parquet
+  ...
   train-09-of-10.parquet
   test.parquet
-  neighbors.parquet          optional, used as precomputed ground truth
+  neighbors.parquet
 ```
 
-Each training and query Parquet file should contain:
+Training and query Parquet files should have `id` and `emb` columns. The optional
+`neighbors.parquet` file should have query `id` and ordered `neighbors_id` columns; when
+present, it is used as precomputed ground truth.
 
-- `id`: integer vector id
-- `emb`: embedding vector column with dimension 1536
-
-The optional `neighbors.parquet` file should contain:
-
-- `id`: query id
-- `neighbors_id`: ordered list of exact nearest-neighbor ids
-
-If the full dataset is too large to keep inside the repository folder, store it elsewhere
-and point the benchmark to it:
+Useful environment overrides:
 
 ```bash
 export CUVS_BENCH_DATA_DIR=/path/to/openai_large_5m
-```
-
-You can also place caches outside the repository:
-
-```bash
 export CUVS_BENCH_DATA_CACHE_DIR=/path/to/data_cache
 export CUVS_BENCH_GROUND_TRUTH_CACHE_DIR=/path/to/ground_truth_cache
-```
-
-The NumPy data cache is enabled by default to avoid repeatedly decoding the large Parquet
-files. Disable it only for debugging:
-
-```bash
 export CUVS_BENCH_USE_DATA_CACHE=0
 ```
 
+Most benchmark settings should be changed in `src/config.py` instead of passed through
+long command lines.
+
 ## Running Benchmarks
 
-Run one IVF-Flat benchmark:
-
-```bash
-python src/benchmark.py
-```
-
-Run the IVF-Flat sweep:
-
-```bash
-python src/sweep_benchmark.py
-```
-
-Run the IVF-PQ sweep:
-
-```bash
-python src/sweep_ivfpq_benchmark.py
-```
-
-Run the current optimized IVF-PQ configuration:
+Run the optimized IVF-PQ configuration:
 
 ```bash
 python src/run_ivf_pq_optimized.py
 ```
 
-The IVF-PQ sweep writes:
+This writes:
 
 ```text
-results/ivfpq_sweep_results.csv
+results/ivfpq_optimized_results.csv
 ```
 
-## Reproducibility Notes
-
-The default benchmark settings live in `src/config.py`. Important values include:
-
-- `K = 10`
-- `QUERY_LIMIT = 1000`
-- `GROUND_TRUTH_TOP_K = 100`
-- `SEARCH_WARMUP_RUNS = 3`
-- `SEARCH_TIMED_RUNS = 10`
-- `DISTRIBUTION_MODE = "sharded"`
-- `SEARCH_MODE = "load_balancer"`
-- `MERGE_MODE = "merge_on_root_rank"`
-
-The current IVF-PQ configuration uses float16 inputs/search internals plus optional exact
-reranking of `IVFPQ_RERANK_CANDIDATE_K = 100` candidates. The default rerank backend is
-the CUDA multi-GPU extension; use `CUVS_BENCH_IVFPQ_RERANK_BACKEND=cpu` for the host
-fallback.
-
-## Tests
-
-Run the smoke test:
+Run the sweeps:
 
 ```bash
-python src/smoke_test.py
+python src/sweep_ivf_flat.py
+python src/sweep_ivf_pq.py
 ```
 
-Run the lightweight unit test:
+The sweep outputs are:
+
+```text
+results/ivf_flat_sweep_results.csv
+results/ivfpq_sweep_results.csv
+results/ivf_flat_qps_vs_recall.png
+results/ivfpq_qps_vs_recall.png
+```
+
+Regenerate charts from existing CSVs:
+
+```bash
+python src/draw_charts.py
+```
+
+When both sweep CSVs exist, this also writes:
+
+```text
+results/ivf_flat_vs_ivfpq_qps_vs_recall.png
+```
+
+## Important Config Values
+
+The optimized IVF-PQ setup is in `IVFPQ_OPTIMIZED_PARAMS`:
+
+```text
+n_lists=4096, pq_bits=4, pq_dim=384, n_probes=32
+```
+
+The exact rerank path uses `IVFPQ_RERANK_CANDIDATE_K = 100`, `K = 10`, and defaults to:
+
+```text
+IVFPQ_RERANK_BACKEND = "session"
+IVFPQ_RERANK_STORAGE_DTYPE = "float16"
+```
+
+Use `CUVS_BENCH_IVFPQ_RERANK_DEVICE_IDS=0` to run the same backend on one GPU.
+Use `CUVS_BENCH_IVFPQ_RERANK_BACKEND=multi_gpu` to run the Python cuVS search plus
+standalone CUDA reranker path.
+Use `CUVS_BENCH_IVFPQ_RERANK_BACKEND=cpu` only for debugging because it is much slower.
+
+## CUDA Rerank Extension
+
+Build the extension after changing the CUDA source:
+
+```bash
+python src/ivf_pq/rerank/build_extension.py
+```
+
+The compiled module is generated under `src/ivf_pq/rerank/extensions/` and ignored by git.
+
+## Tests
 
 ```bash
 python -m unittest discover -s tests
 ```
 
-The smoke test skips the GPU rerank check when CUDA is unavailable. The full benchmark
-scripts require a working CUDA/cuVS environment and the dataset files described above.
+The GPU smoke test skips cleanly when the CUDA/cuVS extension is unavailable.
 
 ## Profiling
 
-Nsight Systems commands and profiling notes are in:
-
-```text
-docs/profiling_notes.md
-```
-
-Generated profiling artifacts should stay in `profiles/`, which is ignored by git.
+Nsight Systems commands and notes are in `docs/profiling_notes.md`. Generated profiling
+artifacts should stay in `profiles/`.
 
 ## License
 

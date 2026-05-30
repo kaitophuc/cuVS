@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
+
 from config import (
     DATA_CACHE_DIR,
     DATA_CACHE_MMAP,
@@ -186,9 +187,3 @@ def print_loaded_data_summary(dataset_ids, dataset, query_ids, queries):
     print("Last dataset id:", dataset_ids[-1])
     print("First query id:", query_ids[0])
     print("Embedding dimension:", dataset.shape[1])
-
-def main():
-    load_default_data(print_info=True)
-
-if __name__ == "__main__":
-    main()

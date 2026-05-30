@@ -6,8 +6,7 @@ from pathlib import Path
 
 
 def main():
-    root_dir = Path(__file__).resolve().parents[2]
-    rerank_dir = root_dir / "src" / "rerank"
+    rerank_dir = Path(__file__).resolve().parent
     python_bin = Path(sys.executable).resolve()
     conda_prefix = Path(os.environ.get("CONDA_PREFIX", python_bin.parents[1])).resolve()
     nvcc = Path(os.environ.get("NVCC", conda_prefix / "bin" / "nvcc")).resolve()
@@ -28,6 +27,7 @@ def main():
         str(nvcc),
         "-std=c++17",
         "-O3",
+        # For extra local tuning, try adding: -lineinfo -arch=native
         "-shared",
         "-Xcompiler=-fPIC",
         *pybind11_includes,
