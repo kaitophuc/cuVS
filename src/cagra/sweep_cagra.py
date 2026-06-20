@@ -40,6 +40,8 @@ def make_config(build_config, itopk_size, batch_size, algo, search_width):
             "max_queries": batch_size,
             "algo": algo,
             "search_width": search_width,
+            "enable_exact_rerank": True,
+            "rerank_candidate_k": itopk_size,
             "n_rows_per_batch": batch_size,
         }
     )

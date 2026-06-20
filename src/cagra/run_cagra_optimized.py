@@ -7,8 +7,8 @@ from collections import defaultdict
 import numpy as np
 import nvtx
 from cuvs.common import MultiGpuResources
-from cuvs.neighbors.mg import cagra
 from cuvs.neighbors import cagra as single_cagra
+from cuvs.neighbors.mg import cagra
 
 import sys
 from pathlib import Path
@@ -37,6 +37,7 @@ from support.data import load_default_data
 from support.ground_truth import get_or_compute_exact_ground_truth
 from support.metrics import calculate_recall_at_k
 from support.timing import measure_synchronized_wall_time
+from ivf_pq.rerank import create_exact_reranker, rerank_ivf_pq_candidates_exact_l2
 
 def _optional_int_list_from_env(name):
     raw_value = os.environ.get(name, "")
@@ -50,6 +51,15 @@ CAGRA_DATASET_DTYPE = os.environ.get("CUVS_BENCH_CAGRA_DATASET_DTYPE", "float16"
 CAGRA_QUERY_DTYPE = os.environ.get("CUVS_BENCH_CAGRA_QUERY_DTYPE", CAGRA_DATASET_DTYPE)
 CAGRA_DEVICE_IDS = _optional_int_list_from_env("CUVS_BENCH_CAGRA_DEVICE_IDS")
 MERGE_MODE = "tree_merge"
+CAGRA_ENABLE_EXACT_RERANK = os.environ.get("CUVS_BENCH_CAGRA_ENABLE_EXACT_RERANK", "1") != "0"
+CAGRA_RERANK_CANDIDATE_K = int(os.environ.get("CUVS_BENCH_CAGRA_RERANK_CANDIDATE_K", "64"))
+CAGRA_RERANK_BATCH_SIZE = int(os.environ.get("CUVS_BENCH_CAGRA_RERANK_BATCH_SIZE", "512"))
+CAGRA_RERANK_BACKEND = os.environ.get("CUVS_BENCH_CAGRA_RERANK_BACKEND", "multi_gpu")
+CAGRA_RERANK_DEVICE_IDS = (
+    _optional_int_list_from_env("CUVS_BENCH_CAGRA_RERANK_DEVICE_IDS")
+    or CAGRA_DEVICE_IDS
+)
+CAGRA_RERANK_STORAGE_DTYPE = os.environ.get("CUVS_BENCH_CAGRA_RERANK_STORAGE_DTYPE", "float16")
 
 CAGRA_OPTIMIZED_PARAMS = {
     "graph_degree": 32,
@@ -59,6 +69,9 @@ CAGRA_OPTIMIZED_PARAMS = {
     "compression_enabled": True,
     "compression_pq_bits": 8,
     "compression_pq_dim": 384,
+
+    "enable_exact_rerank": True,
+    "rerank_candidate_k": 64,
 
     "itopk_size": 64,
     "max_queries": 256,
@@ -117,8 +130,12 @@ def create_index_params(config):
     )
 
 def create_search_params(config):
-    if config["itopk_size"] < K:
-        raise ValueError("CAGRA itopk_size should be at least K")
+    search_k = get_search_k(config)
+    if config["itopk_size"] < search_k:
+        raise ValueError(
+            "CAGRA itopk_size should be at least the requested search_k "
+            f"({config['itopk_size']} < {search_k})"
+        )
 
     return cagra.SearchParams(
         search_mode=SEARCH_MODE,
@@ -138,6 +155,57 @@ def create_search_params(config):
         num_random_samplings=config["num_random_samplings"],
         rand_xor_mask=config["rand_xor_mask"],
     )
+
+def exact_rerank_enabled(config):
+    return config.get("enable_exact_rerank", CAGRA_ENABLE_EXACT_RERANK)
+
+def get_search_k(config):
+    if not exact_rerank_enabled(config):
+        return K
+    return max(K, config.get("rerank_candidate_k", CAGRA_RERANK_CANDIDATE_K))
+
+def validate_rerank_backend():
+    if CAGRA_RERANK_BACKEND not in {"multi_gpu", "cpu"}:
+        raise ValueError(
+            "CUVS_BENCH_CAGRA_RERANK_BACKEND must be 'multi_gpu' or 'cpu'. "
+            "The IVF-PQ 'session' backend owns IVF-PQ search and cannot rerank "
+            "standalone CAGRA candidates."
+        )
+
+def create_cagra_exact_reranker(dataset, dataset_ids, candidate_k):
+    try:
+        return (
+            create_exact_reranker(
+                dataset=dataset,
+                dataset_ids=dataset_ids,
+                final_k=K,
+                candidate_k=candidate_k,
+                batch_size=CAGRA_RERANK_BATCH_SIZE,
+                device_ids=CAGRA_RERANK_DEVICE_IDS,
+                storage_dtype=CAGRA_RERANK_STORAGE_DTYPE,
+            ),
+            CAGRA_RERANK_STORAGE_DTYPE,
+        )
+    except RuntimeError as exc:
+        if CAGRA_RERANK_STORAGE_DTYPE == "float32" or "does not fit" not in str(exc):
+            raise
+
+        print(
+            "Resident float16 reranker did not fit beside the CAGRA index; "
+            "retrying with float32 auto/staged storage."
+        )
+        return (
+            create_exact_reranker(
+                dataset=dataset,
+                dataset_ids=dataset_ids,
+                final_k=K,
+                candidate_k=candidate_k,
+                batch_size=CAGRA_RERANK_BATCH_SIZE,
+                device_ids=CAGRA_RERANK_DEVICE_IDS,
+                storage_dtype="float32",
+            ),
+            "float32",
+        )
 
 def build_cagra_index(dataset, index_params, resources, sync_fn):
     sync_fn()
@@ -163,24 +231,51 @@ def copy_dataset_ids_for_row_neighbors(row_neighbors, dataset_ids, out):
     out[...] = dataset_ids[row_neighbors]
     return out
 
-def make_cagra_search_fn(index, queries, search_params, k, resources, sync_fn, dataset_ids):
-    row_neighbors = np.empty((queries.shape[0], k), dtype=np.int64)
-    id_neighbors = np.empty((queries.shape[0], k), dtype=np.asarray(dataset_ids).dtype)
-    distances = np.empty((queries.shape[0], k), dtype=np.float32)
+def make_cagra_search_fn(
+    index,
+    queries,
+    rerank_queries,
+    search_params,
+    final_k,
+    search_k,
+    resources,
+    sync_fn,
+    dataset_ids,
+    rerank_dataset,
+    exact_rerank,
+    reranker=None,
+):
+    row_neighbors = np.empty((queries.shape[0], search_k), dtype=np.int64)
+    candidate_distances = np.empty((queries.shape[0], search_k), dtype=np.float32)
+    id_neighbors = np.empty((queries.shape[0], final_k), dtype=np.asarray(dataset_ids).dtype)
+    distances = np.empty((queries.shape[0], final_k), dtype=np.float32)
 
     def run_search():
         cagra.search(
             search_params,
             index,
             queries,
-            k,
+            search_k,
             neighbors=row_neighbors,
-            distances=distances,
+            distances=candidate_distances,
             resources=resources
         )
 
         sync_fn()
-        copy_dataset_ids_for_row_neighbors(row_neighbors, dataset_ids, id_neighbors)
+        if exact_rerank:
+            return rerank_ivf_pq_candidates_exact_l2(
+                dataset=rerank_dataset,
+                dataset_ids=dataset_ids,
+                queries=rerank_queries,
+                candidate_neighbors=row_neighbors,
+                final_k=final_k,
+                batch_size=CAGRA_RERANK_BATCH_SIZE,
+                backend=CAGRA_RERANK_BACKEND,
+                reranker=reranker,
+            )
+
+        distances[...] = candidate_distances[:, :final_k]
+        copy_dataset_ids_for_row_neighbors(row_neighbors[:, :final_k], dataset_ids, id_neighbors)
         return distances, id_neighbors
 
     return run_search
@@ -199,12 +294,16 @@ def run_cagra_configs(configs, output_path=CAGRA_RESULTS_CSV):
 
     index_dataset = as_contiguous_dtype(dataset, CAGRA_DATASET_DTYPE)
     search_queries = as_contiguous_dtype(queries, CAGRA_QUERY_DTYPE)
+    rerank_dataset = np.asarray(dataset, dtype=np.float32)
+    rerank_queries = np.asarray(queries, dtype=np.float32)
 
     resources = MultiGpuResources(device_ids=CAGRA_DEVICE_IDS)
     sync_fn = resources.sync
 
     benchmark_queries = search_queries[:OFFLINE_QUERY_COUNT]
     online_queries = search_queries[:ONLINE_QUERY_COUNT]
+    benchmark_rerank_queries = rerank_queries[:OFFLINE_QUERY_COUNT]
+    online_rerank_queries = rerank_queries[:ONLINE_QUERY_COUNT]
     num_queries = benchmark_queries.shape[0]
 
     print("\nRunning CAGRA benchmark")
@@ -217,6 +316,10 @@ def run_cagra_configs(configs, output_path=CAGRA_RESULTS_CSV):
     print("search mode:", SEARCH_MODE)
     print("merge mode:", MERGE_MODE)
     print("device ids:", CAGRA_DEVICE_IDS if CAGRA_DEVICE_IDS is not None else "all visible")
+    print("exact rerank default:", CAGRA_ENABLE_EXACT_RERANK)
+    print("rerank backend:", CAGRA_RERANK_BACKEND)
+    print("rerank storage dtype:", CAGRA_RERANK_STORAGE_DTYPE)
+    validate_rerank_backend()
 
     results = []
     grouped_configs = _group_by_build_params(configs)
@@ -226,6 +329,9 @@ def run_cagra_configs(configs, output_path=CAGRA_RESULTS_CSV):
     for build_key, search_configs in grouped_configs.items():
         build_config = _build_config_from_key(build_key)
         index = None
+        reranker = None
+        reranker_candidate_k = None
+        reranker_storage_dtype = "none"
 
         print(
             "\nBuilding CAGRA index with "
@@ -249,28 +355,62 @@ def run_cagra_configs(configs, output_path=CAGRA_RESULTS_CSV):
                 print(
                     f"\n[{config_number}/{total_configs}] "
                     f"itopk_size={config['itopk_size']}, "
+                    f"search_k={get_search_k(config)}, "
                     f"search_width={config['search_width']}, "
                     f"max_iterations={config['max_iterations']}"
                 )
+
+                exact_rerank = exact_rerank_enabled(config)
+                search_k = get_search_k(config)
+                if exact_rerank and CAGRA_RERANK_BACKEND == "multi_gpu":
+                    if reranker_candidate_k != search_k:
+                        sync_fn()
+                        reranker = None
+                        gc.collect()
+                        sync_fn()
+                        print(
+                            "Creating exact CAGRA reranker "
+                            f"(candidate_k={search_k}, storage={CAGRA_RERANK_STORAGE_DTYPE})..."
+                        )
+                        reranker, reranker_storage_dtype = create_cagra_exact_reranker(
+                            dataset=rerank_dataset,
+                            dataset_ids=dataset_ids,
+                            candidate_k=search_k,
+                        )
+                        reranker_candidate_k = search_k
+                        print(
+                            f"Exact reranker mode: {getattr(reranker, 'mode', 'unknown')} "
+                            f"(storage={reranker_storage_dtype})"
+                        )
 
                 search_params = create_search_params(config)
                 offline_search = make_cagra_search_fn(
                     index=index,
                     queries=benchmark_queries,
+                    rerank_queries=benchmark_rerank_queries,
                     search_params=search_params,
-                    k=K,
+                    final_k=K,
+                    search_k=search_k,
                     resources=resources,
                     sync_fn=sync_fn,
                     dataset_ids=dataset_ids,
+                    rerank_dataset=rerank_dataset,
+                    exact_rerank=exact_rerank,
+                    reranker=reranker,
                 )
                 online_search = make_cagra_search_fn(
                     index=index,
                     queries=online_queries,
+                    rerank_queries=online_rerank_queries,
                     search_params=search_params,
-                    k=K,
+                    final_k=K,
+                    search_k=search_k,
                     resources=resources,
                     sync_fn=sync_fn,
                     dataset_ids=dataset_ids,
+                    rerank_dataset=rerank_dataset,
+                    exact_rerank=exact_rerank,
+                    reranker=reranker,
                 )
 
                 throughput_range = nvtx.start_range("cagra_offline_throughput", color="blue")
@@ -313,6 +453,12 @@ def run_cagra_configs(configs, output_path=CAGRA_RESULTS_CSV):
                 results.append(
                     {
                         **config,
+                        "search_k": search_k,
+                        "exact_rerank": exact_rerank,
+                        "rerank_backend": CAGRA_RERANK_BACKEND if exact_rerank else "none",
+                        "rerank_storage_dtype": (
+                            reranker_storage_dtype if exact_rerank else "none"
+                        ),
                         "build_time": build_time,
                         "search_time": search_time,
                         "online_summary": online_summary,
@@ -329,7 +475,8 @@ def run_cagra_configs(configs, output_path=CAGRA_RESULTS_CSV):
                 sync_fn()
         finally:
             sync_fn()
-            del index
+            reranker = None
+            index = None
             gc.collect()
             sync_fn()
 
@@ -343,6 +490,15 @@ def write_results_csv(results, output_path=CAGRA_RESULTS_CSV):
         "graph_degree",
         "intermediate_graph_degree",
         "build_algo",
+        "compression_enabled",
+        "compression_pq_bits",
+        "compression_pq_dim",
+        "enable_exact_rerank",
+        "rerank_candidate_k",
+        "search_k",
+        "exact_rerank",
+        "rerank_backend",
+        "rerank_storage_dtype",
         "itopk_size",
         "max_queries",
         "max_iterations",
