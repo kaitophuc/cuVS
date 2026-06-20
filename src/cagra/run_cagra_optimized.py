@@ -76,7 +76,7 @@ CAGRA_OPTIMIZED_PARAMS = {
     "itopk_size": 48,
     "max_queries": 256,
     "max_iterations": 0,
-    "algo": "multi_cta",
+    "algo": "auto",
     "team_size": 0,
     "search_width": 1,
     "min_iterations": 0,
