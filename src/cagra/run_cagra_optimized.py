@@ -52,7 +52,7 @@ CAGRA_QUERY_DTYPE = os.environ.get("CUVS_BENCH_CAGRA_QUERY_DTYPE", CAGRA_DATASET
 CAGRA_DEVICE_IDS = _optional_int_list_from_env("CUVS_BENCH_CAGRA_DEVICE_IDS")
 MERGE_MODE = "tree_merge"
 CAGRA_ENABLE_EXACT_RERANK = os.environ.get("CUVS_BENCH_CAGRA_ENABLE_EXACT_RERANK", "1") != "0"
-CAGRA_RERANK_CANDIDATE_K = int(os.environ.get("CUVS_BENCH_CAGRA_RERANK_CANDIDATE_K", "64"))
+CAGRA_RERANK_CANDIDATE_K = int(os.environ.get("CUVS_BENCH_CAGRA_RERANK_CANDIDATE_K", "48"))
 CAGRA_RERANK_BATCH_SIZE = int(os.environ.get("CUVS_BENCH_CAGRA_RERANK_BATCH_SIZE", "512"))
 CAGRA_RERANK_BACKEND = os.environ.get("CUVS_BENCH_CAGRA_RERANK_BACKEND", "multi_gpu")
 CAGRA_RERANK_DEVICE_IDS = (
@@ -71,9 +71,9 @@ CAGRA_OPTIMIZED_PARAMS = {
     "compression_pq_dim": 384,
 
     "enable_exact_rerank": True,
-    "rerank_candidate_k": 64,
+    "rerank_candidate_k": 48,
 
-    "itopk_size": 64,
+    "itopk_size": 48,
     "max_queries": 256,
     "max_iterations": 0,
     "algo": "multi_cta",
