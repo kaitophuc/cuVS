@@ -12,7 +12,7 @@
 //     data_cache/default_data_*/queries.npy
 //   This avoids reimplementing the Python Parquet cache builder.
 // - Loads precomputed ground truth from openai_large_5m/neighbors.parquet.
-// - Exact rerank uses a resident/staged multi-GPU reranker. There is no
+// - Exact rerank uses a resident multi-GPU reranker. There is no
 //   host-side exact-L2 fallback path in this file.
 
 #include <arrow/api.h>
@@ -116,7 +116,7 @@ void check_cuda_device(cudaError_t status, const std::string& where, int device_
     if (status == cudaErrorMemoryAllocation) {
       message << ". MultiGpuExactReranker could not allocate resident dataset shards "
               << "or rerank buffers; reduce visible devices/index memory pressure, "
-              << "reduce rerank batch size, or use float32 staged rerank storage.";
+              << "reduce rerank batch size or index memory pressure.";
     }
 
     throw std::runtime_error(message.str());
@@ -658,7 +658,7 @@ struct MultiGpuResources {
       check_cuvs(cuvsMultiGpuResourcesCreate(&handle), "cuvsMultiGpuResourcesCreate");
     }
 
-    const int pool_percent = getenv_int_or("CUVS_BENCH_CAGRA_MEMORY_POOL_PERCENT", 50);
+    const int pool_percent = getenv_int_or("CUVS_BENCH_CAGRA_MEMORY_POOL_PERCENT", 30);
     if (pool_percent > 0) {
       check_cuvs(cuvsMultiGpuResourcesSetMemoryPool(handle, pool_percent),
                  "cuvsMultiGpuResourcesSetMemoryPool");
@@ -964,24 +964,24 @@ template <>
 std::vector<__half> convert_float_dataset<__half>(const std::vector<float>& src)
 {
   std::vector<__half> dst(src.size());
+  #pragma omp parallel for schedule(static)
   for (size_t i = 0; i < src.size(); ++i) dst[i] = __float2half(src[i]);
   return dst;
 }
 
 enum class RequestedStorageMode {
-  Float32Auto,
+  Float32Resident,
   Float16Resident,
 };
 
 enum class ActiveDatasetMode {
-  StagedFloat32,
   ResidentFloat32,
   ResidentFloat16,
 };
 
 RequestedStorageMode parse_storage_mode(const std::string& storage_dtype)
 {
-  if (storage_dtype == "float32") return RequestedStorageMode::Float32Auto;
+  if (storage_dtype == "float32") return RequestedStorageMode::Float32Resident;
   if (storage_dtype == "float16") return RequestedStorageMode::Float16Resident;
   throw std::invalid_argument("rerank storage dtype must be either 'float32' or 'float16'");
 }
@@ -1024,8 +1024,6 @@ struct SlotBuffers {
   cudaStream_t stream = nullptr;
   float* d_queries = nullptr;
   int64_t* d_candidates = nullptr;
-  float* d_compact_dataset = nullptr;
-  int64_t* d_compact_offsets = nullptr;
   float* d_candidate_distances = nullptr;
   float* d_partial_distances = nullptr;
   int64_t* d_partial_rows = nullptr;
@@ -1079,14 +1077,6 @@ struct DeviceState {
         cudaFree(slot.d_candidates);
         slot.d_candidates = nullptr;
       }
-      if (slot.d_compact_dataset != nullptr) {
-        cudaFree(slot.d_compact_dataset);
-        slot.d_compact_dataset = nullptr;
-      }
-      if (slot.d_compact_offsets != nullptr) {
-        cudaFree(slot.d_compact_offsets);
-        slot.d_compact_offsets = nullptr;
-      }
       if (slot.d_candidate_distances != nullptr) {
         cudaFree(slot.d_candidate_distances);
         slot.d_candidate_distances = nullptr;
@@ -1112,9 +1102,6 @@ struct DeviceState {
 struct HostSlot {
   PinnedHostBuffer<float> queries;
   PinnedHostBuffer<int64_t> candidates;
-  std::vector<PinnedHostBuffer<float>> compact_datasets;
-  std::vector<PinnedHostBuffer<int64_t>> compact_offsets;
-  std::vector<int64_t> compact_rows;
   std::vector<PinnedHostBuffer<float>> partial_distances;
   std::vector<PinnedHostBuffer<int64_t>> partial_rows;
   int64_t start = 0;
@@ -1203,47 +1190,6 @@ __global__ void compute_candidate_l2_half_kernel(
 
     for (int64_t d = thread_idx; d < dim; d += blockDim.x) {
       const float diff = query_row[d] - __half2float(dataset_row[d]);
-      sum += diff * diff;
-    }
-  } else {
-    sum = (thread_idx == 0) ? INFINITY : 0.0f;
-  }
-
-  partial_sums[thread_idx] = sum;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (thread_idx < stride) partial_sums[thread_idx] += partial_sums[thread_idx + stride];
-    __syncthreads();
-  }
-
-  if (thread_idx == 0) {
-    candidate_distances[query_idx * candidate_k + candidate_idx] = partial_sums[0];
-  }
-}
-
-__global__ void compute_candidate_l2_staged_kernel(
-  const float* __restrict__ compact_dataset,
-  const int64_t* __restrict__ compact_offsets,
-  int64_t dim,
-  const float* __restrict__ queries,
-  int64_t candidate_k,
-  float* __restrict__ candidate_distances)
-{
-  const int64_t candidate_idx = blockIdx.x;
-  const int64_t query_idx = blockIdx.y;
-  const int thread_idx = threadIdx.x;
-  const int64_t compact_offset = compact_offsets[query_idx * candidate_k + candidate_idx];
-
-  extern __shared__ float partial_sums[];
-  float sum = 0.0f;
-
-  if (compact_offset >= 0) {
-    const float* dataset_row = compact_dataset + compact_offset * dim;
-    const float* query_row = queries + query_idx * dim;
-
-    for (int64_t d = thread_idx; d < dim; d += blockDim.x) {
-      const float diff = query_row[d] - dataset_row[d];
       sum += diff * diff;
     }
   } else {
@@ -1360,14 +1306,16 @@ public:
       if (!can_use_resident_dataset(sizeof(__half))) {
         throw std::runtime_error(
           "float16 resident rerank dataset does not fit in visible GPU memory. "
-          "Reduce visible devices/index memory pressure, reduce rerank batch size, "
-          "or use CUVS_BENCH_CAGRA_RERANK_STORAGE_DTYPE=float32.");
+          "Reduce visible devices/index memory pressure or reduce rerank batch size.");
       }
       active_dataset_mode_ = ActiveDatasetMode::ResidentFloat16;
     } else {
-      active_dataset_mode_ = can_use_resident_dataset(sizeof(float))
-        ? ActiveDatasetMode::ResidentFloat32
-        : ActiveDatasetMode::StagedFloat32;
+      if (!can_use_resident_dataset(sizeof(float))) {
+        throw std::runtime_error(
+          "float32 resident rerank dataset does not fit in visible GPU memory. "
+          "Reduce visible devices/index memory pressure or reduce rerank batch size.");
+      }
+      active_dataset_mode_ = ActiveDatasetMode::ResidentFloat32;
     }
 
     const int64_t device_count = static_cast<int64_t>(device_ids_.size());
@@ -1454,16 +1402,10 @@ public:
   std::string mode() const
   {
     if (active_dataset_mode_ == ActiveDatasetMode::ResidentFloat16) return "resident_float16";
-    if (active_dataset_mode_ == ActiveDatasetMode::ResidentFloat32) return "resident_float32";
-    return "staged_float32";
+    return "resident_float32";
   }
 
 private:
-  bool uses_staged_dataset() const
-  {
-    return active_dataset_mode_ == ActiveDatasetMode::StagedFloat32;
-  }
-
   bool can_use_resident_dataset(size_t dataset_item_size) const
   {
     constexpr size_t reserve_bytes = static_cast<size_t>(512) * 1024 * 1024;
@@ -1576,14 +1518,6 @@ private:
 
       device_malloc(&slot.d_queries, query_values, "queries", device_id);
       device_malloc(&slot.d_candidates, candidate_values, "candidates", device_id);
-      if (uses_staged_dataset()) {
-        device_malloc(
-          &slot.d_compact_dataset,
-          checked_mul(candidate_values, dim_, "compact dataset"),
-          "compact dataset",
-          device_id);
-        device_malloc(&slot.d_compact_offsets, candidate_values, "compact offsets", device_id);
-      }
       device_malloc(&slot.d_candidate_distances, candidate_values, "candidate distances", device_id);
       device_malloc(&slot.d_partial_distances, output_values, "partial distances", device_id);
       device_malloc(&slot.d_partial_rows, output_values, "partial rows", device_id);
@@ -1600,18 +1534,10 @@ private:
     for (auto& slot : host_slots_) {
       slot.queries.allocate(static_cast<size_t>(query_values));
       slot.candidates.allocate(static_cast<size_t>(candidate_values));
-      slot.compact_rows.assign(devices_.size(), 0);
-      slot.compact_datasets.reserve(devices_.size());
-      slot.compact_offsets.reserve(devices_.size());
       slot.partial_distances.reserve(devices_.size());
       slot.partial_rows.reserve(devices_.size());
 
       for (size_t device_index = 0; device_index < devices_.size(); ++device_index) {
-        if (uses_staged_dataset()) {
-          slot.compact_datasets.emplace_back(
-            static_cast<size_t>(checked_mul(candidate_values, dim_, "host compact dataset")));
-          slot.compact_offsets.emplace_back(static_cast<size_t>(candidate_values));
-        }
         slot.partial_distances.emplace_back(static_cast<size_t>(output_values));
         slot.partial_rows.emplace_back(static_cast<size_t>(output_values));
       }
@@ -1625,42 +1551,6 @@ private:
       const int64_t row = candidates_ptr[i];
       if (row < 0 || row >= n_rows_) {
         throw std::out_of_range("candidate_neighbors contains an invalid dataset row index");
-      }
-    }
-  }
-
-  size_t owner_for_row(int64_t row) const
-  {
-    size_t owner = static_cast<size_t>((row * static_cast<int64_t>(devices_.size())) / n_rows_);
-    if (owner >= devices_.size()) owner = devices_.size() - 1;
-    return owner;
-  }
-
-  void fill_staged_compact_buffers(HostSlot& host_slot, int64_t batch_queries)
-  {
-    const int64_t candidate_values =
-      checked_mul(batch_queries, candidate_k_, "candidate values");
-
-    for (size_t device_index = 0; device_index < devices_.size(); ++device_index) {
-      host_slot.compact_rows[device_index] = 0;
-      std::fill(
-        host_slot.compact_offsets[device_index].data(),
-        host_slot.compact_offsets[device_index].data() + candidate_values,
-        int64_t{-1});
-    }
-
-    for (int64_t local_q = 0; local_q < batch_queries; ++local_q) {
-      for (int64_t candidate_idx = 0; candidate_idx < candidate_k_; ++candidate_idx) {
-        const int64_t flat_idx = local_q * candidate_k_ + candidate_idx;
-        const int64_t row = host_slot.candidates.data()[flat_idx];
-        const size_t owner = owner_for_row(row);
-        const int64_t compact_row = host_slot.compact_rows[owner]++;
-
-        host_slot.compact_offsets[owner].data()[flat_idx] = compact_row;
-        std::memcpy(
-          host_slot.compact_datasets[owner].data() + compact_row * dim_,
-          host_dataset_ptr_ + row * dim_,
-          checked_bytes(dim_, sizeof(float), "compact row copy"));
       }
     }
   }
@@ -1691,8 +1581,6 @@ private:
       candidates_ptr + start * candidate_k_,
       checked_bytes(candidate_values, sizeof(int64_t), "candidate copy"));
 
-    if (uses_staged_dataset()) fill_staged_compact_buffers(host_slot, batch_queries);
-
     for (size_t device_index = 0; device_index < devices_.size(); ++device_index) {
       DeviceState& device = *devices_[device_index];
       DeviceGuard guard(device.device_id);
@@ -1717,32 +1605,6 @@ private:
           slot.stream),
         "copy candidates to device",
         device.device_id);
-
-      if (uses_staged_dataset()) {
-        check_cuda_device(
-          cudaMemcpyAsync(
-            slot.d_compact_offsets,
-            host_slot.compact_offsets[device_index].data(),
-            checked_bytes(candidate_values, sizeof(int64_t), "compact offset H2D"),
-            cudaMemcpyHostToDevice,
-            slot.stream),
-          "copy compact offsets to device",
-          device.device_id);
-
-        const int64_t compact_values =
-          checked_mul(host_slot.compact_rows[device_index], dim_, "compact values");
-        if (compact_values > 0) {
-          check_cuda_device(
-            cudaMemcpyAsync(
-              slot.d_compact_dataset,
-              host_slot.compact_datasets[device_index].data(),
-              checked_bytes(compact_values, sizeof(float), "compact dataset H2D"),
-              cudaMemcpyHostToDevice,
-              slot.stream),
-            "copy compact dataset to device",
-            device.device_id);
-        }
-      }
 
       const dim3 distance_grid(
         static_cast<unsigned int>(candidate_k_),
@@ -1778,20 +1640,6 @@ private:
           slot.d_candidate_distances);
         check_cuda_device(
           cudaGetLastError(), "launch compute_candidate_l2_half_kernel", device.device_id);
-      } else {
-        compute_candidate_l2_staged_kernel<<<
-          distance_grid,
-          kDistanceThreads,
-          sizeof(float) * kDistanceThreads,
-          slot.stream>>>(
-          slot.d_compact_dataset,
-          slot.d_compact_offsets,
-          dim_,
-          slot.d_queries,
-          candidate_k_,
-          slot.d_candidate_distances);
-        check_cuda_device(
-          cudaGetLastError(), "launch compute_candidate_l2_staged_kernel", device.device_id);
       }
 
       select_local_topk_kernel<<<
@@ -1925,8 +1773,8 @@ private:
   int64_t final_k_ = 0;
   int64_t candidate_k_ = 0;
   int64_t batch_size_ = 0;
-  RequestedStorageMode requested_storage_mode_ = RequestedStorageMode::Float32Auto;
-  ActiveDatasetMode active_dataset_mode_ = ActiveDatasetMode::StagedFloat32;
+  RequestedStorageMode requested_storage_mode_ = RequestedStorageMode::Float16Resident;
+  ActiveDatasetMode active_dataset_mode_ = ActiveDatasetMode::ResidentFloat16;
   const float* host_dataset_ptr_ = nullptr;
   std::vector<int> device_ids_;
   std::vector<int64_t> dataset_ids_;
@@ -2230,26 +2078,10 @@ std::unique_ptr<MultiGpuExactReranker> create_cagra_exact_reranker(
   const std::string& requested_storage_dtype,
   std::string* active_storage_dtype)
 {
-  try {
-    auto reranker = std::make_unique<MultiGpuExactReranker>(
-      data, K, candidate_k, batch_size, device_ids, requested_storage_dtype);
-    if (active_storage_dtype != nullptr) *active_storage_dtype = requested_storage_dtype;
-    return reranker;
-  } catch (const std::runtime_error& exc) {
-    const bool can_retry_staged =
-      requested_storage_dtype == "float16" &&
-      std::string(exc.what()).find("does not fit") != std::string::npos;
-    if (!can_retry_staged) throw;
-
-    std::cout
-      << "Resident float16 reranker did not fit beside the CAGRA index; "
-      << "retrying with float32 auto/staged storage.\n";
-
-    auto reranker = std::make_unique<MultiGpuExactReranker>(
-      data, K, candidate_k, batch_size, device_ids, "float32");
-    if (active_storage_dtype != nullptr) *active_storage_dtype = "float32";
-    return reranker;
-  }
+  auto reranker = std::make_unique<MultiGpuExactReranker>(
+    data, K, candidate_k, batch_size, device_ids, requested_storage_dtype);
+  if (active_storage_dtype != nullptr) *active_storage_dtype = requested_storage_dtype;
+  return reranker;
 }
 
 template <typename T>
