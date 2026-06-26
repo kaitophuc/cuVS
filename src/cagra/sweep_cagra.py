@@ -7,7 +7,7 @@ SRC_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SRC_DIR))
 
 from config import RESULTS_DIR
-from run_cagra_optimized import CAGRA_OPTIMIZED_PARAMS, run_cagra_configs
+from cagra.run_cagra_optimized import CAGRA_OPTIMIZED_PARAMS, run_cagra_configs
 
 
 CAGRA_SWEEP_RESULTS_CSV = RESULTS_DIR / "cagra_sweep_results.csv"

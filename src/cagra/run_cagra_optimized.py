@@ -1,20 +1,20 @@
 import csv
 import gc
 import os
+import sys
 import time
 from collections import defaultdict
+from pathlib import Path
+
+SRC_DIR = Path(__file__).resolve().parents[1]
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 import numpy as np
 import nvtx
 from cuvs.common import MultiGpuResources
 from cuvs.neighbors import cagra as single_cagra
 from cuvs.neighbors.mg import cagra
-
-import sys
-from pathlib import Path
-
-SRC_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SRC_DIR))
 
 from config import (
     DISPLAY_TOP_K,
@@ -281,6 +281,9 @@ def make_cagra_search_fn(
     return run_search
 
 def run_cagra_configs(configs, output_path=CAGRA_RESULTS_CSV):
+    resources = MultiGpuResources(device_ids=CAGRA_DEVICE_IDS)
+    sync_fn = resources.sync
+
     dataset_ids, dataset, _, queries = load_default_data(print_info=True)
     _, ground_truth_neighbors = get_or_compute_exact_ground_truth(
         dataset=dataset,
@@ -296,9 +299,6 @@ def run_cagra_configs(configs, output_path=CAGRA_RESULTS_CSV):
     search_queries = as_contiguous_dtype(queries, CAGRA_QUERY_DTYPE)
     rerank_dataset = np.asarray(dataset, dtype=np.float32)
     rerank_queries = np.asarray(queries, dtype=np.float32)
-
-    resources = MultiGpuResources(device_ids=CAGRA_DEVICE_IDS)
-    sync_fn = resources.sync
 
     benchmark_queries = search_queries[:OFFLINE_QUERY_COUNT]
     online_queries = search_queries[:ONLINE_QUERY_COUNT]

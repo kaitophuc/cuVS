@@ -1,8 +1,8 @@
 # cuVS Multi-GPU ANN Benchmarks
 
 This project benchmarks multi-GPU approximate nearest-neighbor search with RAPIDS cuVS.
-The main focus is IVF-PQ on the 5M OpenAI embedding dataset, with IVF-Flat kept as a
-comparison baseline for sweeps and report charts.
+The main focus is IVF-PQ and CAGRA on the 5M OpenAI embedding dataset, with IVF-Flat
+kept as a comparison baseline for sweeps and report charts.
 
 ## Current Baseline
 
@@ -10,7 +10,9 @@ comparison baseline for sweeps and report charts.
 - Database size: 5,000,000 vectors when all 10 training shards are present
 - Query set: 1,000 vectors from `test.parquet`
 - Metric: squared L2 / `sqeuclidean`
-- Main run: `python src/run_ivf_pq_optimized.py`
+- Main IVF-PQ run: `python src/run_ivf_pq_optimized.py`
+- Main CAGRA Python run: see the CAGRA command in Running Benchmarks
+- Main CAGRA C++ run: `./run_cagra_optimized.sh`
 - Expected optimized result on the current local setup: about `0.93` Recall@10 and
   roughly `120k` QPS with the fused C++ session backend
 
@@ -24,6 +26,7 @@ src/
   sweep_ivf_pq.py           IVF-PQ sweep entrypoint
   draw_charts.py            Regenerate charts from existing CSV files
   support/                  Data loading, ground truth, metrics, timing, chart helpers
+  cagra/                    CAGRA Python runner, sweep, and standalone C++/CUDA source
   ivf_flat/                 IVF-Flat index helpers and sweep code
   ivf_pq/                   IVF-PQ index helpers, benchmark flow, sweep code
     rerank/                 Exact rerank wrapper and CUDA extension source
@@ -88,11 +91,36 @@ This writes:
 results/ivfpq_optimized_results.csv
 ```
 
+Run the optimized CAGRA Python configuration:
+
+```bash
+python -c "import sys; from pathlib import Path; sys.path.insert(0, str(Path('src').resolve())); from cagra.run_cagra_optimized import main; main()"
+```
+
+This writes:
+
+```text
+results/cagra_optimized_results.csv
+```
+
+The direct file form `python src/cagra/run_cagra_optimized.py` can trip cuVS
+multi-GPU resource initialization on this local RAPIDS/CUDA stack, so the command above
+imports the runner as a module instead.
+
+Run the standalone C++/CUDA CAGRA executable:
+
+```bash
+./run_cagra_optimized.sh
+```
+
+Use `./run_cagra_optimized.sh --build-only` to only rebuild the executable.
+
 Run the sweeps:
 
 ```bash
 python src/sweep_ivf_flat.py
 python src/sweep_ivf_pq.py
+python -c "import sys; from pathlib import Path; sys.path.insert(0, str(Path('src').resolve())); from cagra.sweep_cagra import main; main()"
 ```
 
 The sweep outputs are:
@@ -100,6 +128,7 @@ The sweep outputs are:
 ```text
 results/ivf_flat_sweep_results.csv
 results/ivfpq_sweep_results.csv
+results/cagra_sweep_results.csv
 results/ivf_flat_qps_vs_recall.png
 results/ivfpq_qps_vs_recall.png
 ```
@@ -136,6 +165,19 @@ Use `CUVS_BENCH_IVFPQ_RERANK_BACKEND=multi_gpu` to run the Python cuVS search pl
 standalone CUDA reranker path.
 Use `CUVS_BENCH_IVFPQ_RERANK_BACKEND=cpu` only for debugging because it is much slower.
 
+The optimized CAGRA setup lives in `src/cagra/run_cagra_optimized.py`:
+
+```text
+graph_degree=32, intermediate_graph_degree=64, build_algo=ivf_pq,
+compression_pq_bits=8, compression_pq_dim=384, itopk_size=48
+```
+
+CAGRA exact rerank defaults to `CUVS_BENCH_CAGRA_RERANK_BACKEND=multi_gpu`,
+`CUVS_BENCH_CAGRA_RERANK_CANDIDATE_K=48`, and
+`CUVS_BENCH_CAGRA_RERANK_STORAGE_DTYPE=float16`. Use
+`CUVS_BENCH_CAGRA_DEVICE_IDS=0` or `CUVS_BENCH_CAGRA_RERANK_DEVICE_IDS=0` to restrict
+the CAGRA index or reranker to one GPU.
+
 ## CUDA Rerank Extension
 
 Build the extension after changing the CUDA source:
@@ -145,6 +187,8 @@ python src/ivf_pq/rerank/build_extension.py
 ```
 
 The compiled module is generated under `src/ivf_pq/rerank/extensions/` and ignored by git.
+Rebuild it after CUDA/cuVS environment changes too; a stale extension may fail to import
+with an error such as `libcudart.so.12: cannot open shared object file`.
 
 ## Tests
 
