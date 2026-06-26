@@ -4,8 +4,10 @@
 //
 // Notes:
 // - Uses the cuVS C API from C++ because it mirrors the Python multi-GPU binding.
-// - Uses cuvsRMMHostAlloc/cuvsRMMHostFree for pinned host query/output buffers.
-// - Uses cuvsMultiGpuResourcesSetMemoryPool to reduce device allocation churn.
+// - Uses cuvsRMMHostAlloc/cuvsRMMHostFree for pinned host dataset/query/output buffers.
+// - Defaults RAFT/RMM workspace allocations to CUDA async memory pools to avoid
+//   synchronizing cudaFree calls. Set CUVS_BENCH_CAGRA_DEVICE_ALLOCATOR=rmm_pool
+//   to use cuvsMultiGpuResourcesSetMemoryPool instead.
 // - Loads the Python data cache .npy files:
 //     data_cache/default_data_*/dataset_ids.npy
 //     data_cache/default_data_*/dataset.npy
@@ -26,6 +28,14 @@
 #include <cuvs/neighbors/cagra.h>
 #include <cuvs/neighbors/mg_cagra.h>
 #include <dlpack/dlpack.h>
+#include <raft/core/resource/cuda_stream.hpp>
+#include <raft/core/resource/device_id.hpp>
+#include <raft/core/resource/device_memory_resource.hpp>
+#include <raft/core/resource/multi_gpu.hpp>
+#include <raft/core/resources.hpp>
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -38,14 +48,12 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <map>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -63,8 +71,6 @@ constexpr int SEARCH_TIMED_RUNS = 10;
 constexpr double MS_PER_SECOND = 1000.0;
 constexpr int kDistanceThreads = 256;
 constexpr int kMaxFinalK = 256;
-constexpr int kConvertThreads = 256;
-constexpr size_t kHalfUploadChunkBytes = static_cast<size_t>(64) * 1024 * 1024;
 
 const std::string METRIC = "sqeuclidean";
 const std::string DISTRIBUTION_MODE = "sharded";
@@ -138,13 +144,6 @@ T arrow_value_or_throw(arrow::Result<T> result, const std::string& where)
     throw std::runtime_error(where + ": " + result.status().ToString());
   }
   return std::move(result).ValueOrDie();
-}
-
-void arrow_check(const arrow::Status& status, const std::string& where)
-{
-  if (!status.ok()) {
-    throw std::runtime_error(where + ": " + status.ToString());
-  }
 }
 
 int64_t checked_mul(int64_t lhs, int64_t rhs, const char* name)
@@ -250,14 +249,6 @@ struct MatrixViewHost {
   T* data = nullptr;
   int64_t rows = 0;
   int64_t cols = 0;
-
-  size_t size() const { return static_cast<size_t>(rows * cols); }
-
-  T* row(int64_t r) { return data + r * cols; }
-  const T* row(int64_t r) const { return data + r * cols; }
-
-  T& operator()(int64_t r, int64_t c) { return data[r * cols + c]; }
-  const T& operator()(int64_t r, int64_t c) const { return data[r * cols + c]; }
 };
 
 struct NpyHeader {
@@ -645,6 +636,11 @@ struct DlpackVector {
 };
 
 struct MultiGpuResources {
+  struct RankStream {
+    int device_id = 0;
+    cudaStream_t stream = nullptr;
+  };
+
   cuvsResources_t handle = 0;
 
   explicit MultiGpuResources(const std::optional<std::vector<int>>& device_ids)
@@ -658,24 +654,49 @@ struct MultiGpuResources {
       check_cuvs(cuvsMultiGpuResourcesCreate(&handle), "cuvsMultiGpuResourcesCreate");
     }
 
-    const int pool_percent = getenv_int_or("CUVS_BENCH_CAGRA_MEMORY_POOL_PERCENT", 30);
-    if (pool_percent > 0) {
-      check_cuvs(cuvsMultiGpuResourcesSetMemoryPool(handle, pool_percent),
-                 "cuvsMultiGpuResourcesSetMemoryPool");
-      std::cout << "device memory pool: " << pool_percent << "% of free memory\n";
+    configure_rank_streams();
+
+    const std::string allocator =
+      getenv_or("CUVS_BENCH_CAGRA_DEVICE_ALLOCATOR", "cuda_async");
+    if (allocator == "cuda_async") {
+      configure_cuda_async_allocator();
+      std::cout << "device allocator: cuda_async memory pool\n";
+    } else if (allocator == "rmm_pool") {
+      const int pool_percent = getenv_int_or("CUVS_BENCH_CAGRA_MEMORY_POOL_PERCENT", 30);
+      if (pool_percent > 0) {
+        check_cuvs(cuvsMultiGpuResourcesSetMemoryPool(handle, pool_percent),
+                   "cuvsMultiGpuResourcesSetMemoryPool");
+        bind_workspace_to_current_resources();
+        std::cout << "device allocator: RMM pool, " << pool_percent
+                  << "% of free memory\n";
+      } else {
+        std::cout << "device allocator: RMM pool requested but disabled by percent=0\n";
+      }
+    } else if (allocator == "none") {
+      std::cout << "device allocator: cuVS default\n";
     } else {
-      std::cout << "device memory pool: disabled\n";
+      throw std::runtime_error(
+        "CUVS_BENCH_CAGRA_DEVICE_ALLOCATOR must be 'cuda_async', 'rmm_pool', or 'none'");
     }
   }
 
   ~MultiGpuResources()
   {
+    try {
+      sync();
+    } catch (...) {
+    }
+
     if (handle != 0) {
       try {
         check_cuvs(cuvsMultiGpuResourcesDestroy(handle), "cuvsMultiGpuResourcesDestroy");
       } catch (...) {
       }
+      handle = 0;
     }
+
+    destroy_rank_streams();
+    reset_cuda_async_allocator();
   }
 
   MultiGpuResources(const MultiGpuResources&) = delete;
@@ -684,7 +705,121 @@ struct MultiGpuResources {
   void sync() const
   {
     check_cuvs(cuvsStreamSync(handle), "cuvsStreamSync");
+    for (const RankStream& rank_stream : rank_streams_) {
+      DeviceGuard guard(rank_stream.device_id);
+      check_cuda_device(
+        cudaStreamSynchronize(rank_stream.stream),
+        "sync rank CUDA stream",
+        rank_stream.device_id);
+    }
   }
+
+private:
+  raft::resources& raft_resources() const
+  {
+    return *reinterpret_cast<raft::resources*>(handle);
+  }
+
+  std::vector<raft::resources>& world_resources() const
+  {
+    return raft::resource::get_multi_gpu_resource(raft_resources());
+  }
+
+  void configure_rank_streams()
+  {
+    if (getenv_or("CUVS_BENCH_CAGRA_NONBLOCKING_STREAMS", "1") == "0") {
+      std::cout << "rank CUDA streams: cuVS defaults\n";
+      return;
+    }
+
+    auto& world = world_resources();
+    rank_streams_.reserve(world.size());
+
+    for (int rank = 0; rank < static_cast<int>(world.size()); ++rank) {
+      const raft::resources& device_resources =
+        raft::resource::set_current_device_to_rank(raft_resources(), rank);
+      const int device_id = raft::resource::get_device_id(device_resources);
+
+      cudaStream_t stream = nullptr;
+      check_cuda_device(
+        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+        "cudaStreamCreateWithFlags rank stream",
+        device_id);
+
+      raft::resource::set_cuda_stream(device_resources, rmm::cuda_stream_view(stream));
+      rank_streams_.push_back(RankStream{device_id, stream});
+    }
+
+    if (!rank_streams_.empty()) {
+      check_cuvs(cuvsStreamSet(handle, rank_streams_.front().stream), "cuvsStreamSet");
+    }
+
+    std::cout << "rank CUDA streams: nonblocking per GPU\n";
+  }
+
+  void configure_cuda_async_allocator()
+  {
+    auto& world = world_resources();
+    async_device_resources_.reserve(world.size());
+    async_device_ids_.reserve(world.size());
+
+    for (int rank = 0; rank < static_cast<int>(world.size()); ++rank) {
+      const raft::resources& device_resources =
+        raft::resource::set_current_device_to_rank(raft_resources(), rank);
+      const int device_id = raft::resource::get_device_id(device_resources);
+
+      auto async_resource =
+        std::make_shared<rmm::mr::cuda_async_memory_resource>();
+      raft::mr::device_resource raft_async_resource{*async_resource};
+
+      rmm::mr::set_per_device_resource(
+        rmm::cuda_device_id{device_id},
+        raft::mr::device_resource{*async_resource});
+      raft::resource::set_workspace_resource(device_resources, raft_async_resource);
+      raft::resource::set_large_workspace_resource(device_resources, std::move(raft_async_resource));
+
+      async_device_ids_.push_back(device_id);
+      async_device_resources_.push_back(std::move(async_resource));
+    }
+  }
+
+  void bind_workspace_to_current_resources()
+  {
+    auto& world = world_resources();
+    for (int rank = 0; rank < static_cast<int>(world.size()); ++rank) {
+      const raft::resources& device_resources =
+        raft::resource::set_current_device_to_rank(raft_resources(), rank);
+      raft::resource::set_workspace_to_global_resource(device_resources);
+      raft::resource::set_large_workspace_resource(
+        device_resources,
+        raft::mr::device_resource{rmm::mr::get_current_device_resource_ref()});
+    }
+  }
+
+  void destroy_rank_streams() noexcept
+  {
+    for (RankStream& rank_stream : rank_streams_) {
+      if (rank_stream.stream == nullptr) continue;
+      cudaSetDevice(rank_stream.device_id);
+      cudaStreamDestroy(rank_stream.stream);
+      rank_stream.stream = nullptr;
+    }
+    rank_streams_.clear();
+  }
+
+  void reset_cuda_async_allocator() noexcept
+  {
+    for (int device_id : async_device_ids_) {
+      cudaSetDevice(device_id);
+      rmm::mr::reset_per_device_resource(rmm::cuda_device_id{device_id});
+    }
+    async_device_ids_.clear();
+    async_device_resources_.clear();
+  }
+
+  std::vector<RankStream> rank_streams_;
+  std::vector<int> async_device_ids_;
+  std::vector<std::shared_ptr<rmm::mr::cuda_async_memory_resource>> async_device_resources_;
 };
 
 struct MultiGpuCagraIndex {
@@ -736,43 +871,6 @@ struct CagraConfig {
   uint64_t rand_xor_mask = 0x128394;
   int64_t n_rows_per_batch = 256;
 };
-
-struct BuildKey {
-  int graph_degree;
-  int intermediate_graph_degree;
-  std::string build_algo;
-  bool compression_enabled;
-  int compression_pq_bits;
-  int compression_pq_dim;
-
-  bool operator<(const BuildKey& other) const
-  {
-    return std::tie(graph_degree,
-                    intermediate_graph_degree,
-                    build_algo,
-                    compression_enabled,
-                    compression_pq_bits,
-                    compression_pq_dim) <
-           std::tie(other.graph_degree,
-                    other.intermediate_graph_degree,
-                    other.build_algo,
-                    other.compression_enabled,
-                    other.compression_pq_bits,
-                    other.compression_pq_dim);
-  }
-};
-
-BuildKey build_key_from_config(const CagraConfig& c)
-{
-  return BuildKey{
-    c.graph_degree,
-    c.intermediate_graph_degree,
-    c.build_algo,
-    c.compression_enabled,
-    c.compression_pq_bits,
-    c.compression_pq_dim,
-  };
-}
 
 bool exact_rerank_enabled(const CagraConfig& c)
 {
@@ -966,6 +1064,29 @@ std::vector<__half> convert_float_dataset<__half>(const std::vector<float>& src)
   std::vector<__half> dst(src.size());
   #pragma omp parallel for schedule(static)
   for (size_t i = 0; i < src.size(); ++i) dst[i] = __float2half(src[i]);
+  return dst;
+}
+
+template <typename T>
+PinnedHostBuffer<T> convert_float_dataset_pinned(const std::vector<float>& src)
+{
+  PinnedHostBuffer<T> dst(src.size());
+  #pragma omp parallel for schedule(static)
+  for (int64_t i = 0; i < static_cast<int64_t>(src.size()); ++i) {
+    dst[static_cast<size_t>(i)] = static_cast<T>(src[static_cast<size_t>(i)]);
+  }
+  return dst;
+}
+
+template <>
+PinnedHostBuffer<__half> convert_float_dataset_pinned<__half>(
+  const std::vector<float>& src)
+{
+  PinnedHostBuffer<__half> dst(src.size());
+  #pragma omp parallel for schedule(static)
+  for (int64_t i = 0; i < static_cast<int64_t>(src.size()); ++i) {
+    dst[static_cast<size_t>(i)] = __float2half(src[static_cast<size_t>(i)]);
+  }
   return dst;
 }
 
@@ -1209,15 +1330,6 @@ __global__ void compute_candidate_l2_half_kernel(
   }
 }
 
-__global__ void float_to_half_kernel(
-  const float* __restrict__ input,
-  __half* __restrict__ output,
-  int64_t count)
-{
-  const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < count) output[idx] = __float2half(input[idx]);
-}
-
 __global__ void select_local_topk_kernel(
   const float* __restrict__ candidate_distances,
   const int64_t* __restrict__ candidates,
@@ -1271,13 +1383,16 @@ public:
     int64_t final_k,
     int64_t candidate_k,
     int64_t batch_size,
+    const float* pinned_float_dataset,
+    const __half* pinned_half_dataset,
     const std::optional<std::vector<int>>& device_ids,
     const std::string& storage_dtype)
     : final_k_(final_k),
       candidate_k_(candidate_k),
       batch_size_(batch_size),
       requested_storage_mode_(parse_storage_mode(storage_dtype)),
-      host_dataset_ptr_(data.dataset.data()),
+      pinned_float_dataset_(pinned_float_dataset),
+      pinned_half_dataset_(pinned_half_dataset),
       device_ids_(resolve_device_ids(device_ids)),
       dataset_ids_(data.dataset_ids)
   {
@@ -1303,6 +1418,11 @@ public:
     if (batch_size_ <= 0) throw std::invalid_argument("rerank batch_size must be positive");
 
     if (requested_storage_mode_ == RequestedStorageMode::Float16Resident) {
+      if (pinned_half_dataset_ == nullptr) {
+        throw std::invalid_argument(
+          "float16 rerank storage requires a pinned float16 host dataset. "
+          "Set CUVS_BENCH_CAGRA_DATASET_DTYPE=float16.");
+      }
       if (!can_use_resident_dataset(sizeof(__half))) {
         throw std::runtime_error(
           "float16 resident rerank dataset does not fit in visible GPU memory. "
@@ -1310,6 +1430,11 @@ public:
       }
       active_dataset_mode_ = ActiveDatasetMode::ResidentFloat16;
     } else {
+      if (pinned_float_dataset_ == nullptr) {
+        throw std::invalid_argument(
+          "float32 rerank storage requires a pinned float32 host dataset. "
+          "Set CUVS_BENCH_CAGRA_DATASET_DTYPE=float32.");
+      }
       if (!can_use_resident_dataset(sizeof(float))) {
         throw std::runtime_error(
           "float32 resident rerank dataset does not fit in visible GPU memory. "
@@ -1334,32 +1459,19 @@ public:
           "dataset shard",
           device_id);
 
-        if (state->shard_rows() > 0) {
-          check_cuda_device(
-            cudaMemcpy(
-              state->d_dataset_float,
-              host_dataset_ptr_ + shard_start * dim_,
-              checked_bytes(
-                checked_mul(state->shard_rows(), dim_, "dataset shard"),
-                sizeof(float),
-                "dataset shard"),
-              cudaMemcpyHostToDevice),
-            "copy dataset shard to device",
-            device_id);
-        }
       } else if (active_dataset_mode_ == ActiveDatasetMode::ResidentFloat16) {
         device_malloc(
           &state->d_dataset_half,
           checked_mul(state->shard_rows(), dim_, "dataset shard"),
           "float16 dataset shard",
           device_id);
-        upload_half_dataset_shard(*state, shard_start);
       }
 
       allocate_slots(*state);
       devices_.push_back(std::move(state));
     }
 
+    upload_dataset_shards();
     allocate_host_slots();
   }
 
@@ -1431,18 +1543,12 @@ private:
       const int64_t shard_values = checked_mul(shard_rows, dim_, "dataset shard");
       const size_t shard_bytes =
         checked_bytes(shard_values, dataset_item_size, "dataset shard");
-      const size_t upload_staging_bytes = dataset_item_size == sizeof(__half)
-        ? std::min(
-            checked_bytes(shard_values, sizeof(float), "float16 upload staging"),
-            kHalfUploadChunkBytes)
-        : 0;
-
       DeviceGuard guard(device_id);
       size_t free_bytes = 0;
       size_t total_bytes = 0;
       check_cuda_device(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo", device_id);
 
-      if (shard_bytes + slot_bytes + upload_staging_bytes + reserve_bytes > free_bytes) {
+      if (shard_bytes + slot_bytes + reserve_bytes > free_bytes) {
         return false;
       }
     }
@@ -1450,57 +1556,74 @@ private:
     return true;
   }
 
-  void upload_half_dataset_shard(DeviceState& state, int64_t shard_start)
+  void upload_dataset_shards()
   {
-    const int device_id = state.device_id;
-    DeviceGuard guard(device_id);
-    const int64_t total_values = checked_mul(state.shard_rows(), dim_, "float16 dataset shard");
-    if (total_values == 0) return;
-
-    const int64_t max_chunk_values =
-      static_cast<int64_t>(std::max<size_t>(1, kHalfUploadChunkBytes / sizeof(float)));
-    const int64_t chunk_values = std::min(total_values, max_chunk_values);
-
-    cudaStream_t stream = nullptr;
-    float* d_upload = nullptr;
+    std::vector<cudaStream_t> upload_streams(devices_.size(), nullptr);
 
     try {
-      check_cuda_device(
-        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
-        "cudaStreamCreateWithFlags float16 upload",
-        device_id);
-      device_malloc(&d_upload, chunk_values, "float16 upload staging", device_id);
+      for (size_t device_index = 0; device_index < devices_.size(); ++device_index) {
+        DeviceState& state = *devices_[device_index];
+        if (state.shard_rows() == 0) continue;
 
-      const float* host_shard = host_dataset_ptr_ + shard_start * dim_;
-      for (int64_t offset = 0; offset < total_values; offset += chunk_values) {
-        const int64_t values_this_chunk = std::min(chunk_values, total_values - offset);
-
+        DeviceGuard guard(state.device_id);
         check_cuda_device(
-          cudaMemcpyAsync(
-            d_upload,
-            host_shard + offset,
-            checked_bytes(values_this_chunk, sizeof(float), "float16 upload chunk"),
-            cudaMemcpyHostToDevice,
-            stream),
-          "copy float16 upload chunk to device",
-          device_id);
+          cudaStreamCreateWithFlags(&upload_streams[device_index], cudaStreamNonBlocking),
+          "cudaStreamCreateWithFlags dataset upload",
+          state.device_id);
 
-        const int blocks =
-          static_cast<int>((values_this_chunk + kConvertThreads - 1) / kConvertThreads);
-        float_to_half_kernel<<<blocks, kConvertThreads, 0, stream>>>(
-          d_upload, state.d_dataset_half + offset, values_this_chunk);
-        check_cuda_device(cudaGetLastError(), "launch float_to_half_kernel", device_id);
+        const int64_t shard_values =
+          checked_mul(state.shard_rows(), dim_, "dataset shard");
+        if (active_dataset_mode_ == ActiveDatasetMode::ResidentFloat16) {
+          check_cuda_device(
+            cudaMemcpyAsync(
+              state.d_dataset_half,
+              pinned_half_dataset_ + state.shard_start * dim_,
+              checked_bytes(shard_values, sizeof(__half), "float16 dataset shard"),
+              cudaMemcpyHostToDevice,
+              upload_streams[device_index]),
+            "copy pinned float16 dataset shard to device",
+            state.device_id);
+        } else {
+          check_cuda_device(
+            cudaMemcpyAsync(
+              state.d_dataset_float,
+              pinned_float_dataset_ + state.shard_start * dim_,
+              checked_bytes(shard_values, sizeof(float), "float32 dataset shard"),
+              cudaMemcpyHostToDevice,
+              upload_streams[device_index]),
+            "copy pinned float32 dataset shard to device",
+            state.device_id);
+        }
       }
 
-      check_cuda_device(cudaStreamSynchronize(stream), "sync float16 upload stream", device_id);
+      for (size_t device_index = 0; device_index < devices_.size(); ++device_index) {
+        if (upload_streams[device_index] == nullptr) continue;
+        DeviceState& state = *devices_[device_index];
+        DeviceGuard guard(state.device_id);
+        check_cuda_device(
+          cudaStreamSynchronize(upload_streams[device_index]),
+          "sync dataset upload stream",
+          state.device_id);
+      }
     } catch (...) {
-      if (d_upload != nullptr) cudaFree(d_upload);
-      if (stream != nullptr) cudaStreamDestroy(stream);
+      for (size_t device_index = 0; device_index < devices_.size(); ++device_index) {
+        if (upload_streams[device_index] == nullptr) continue;
+        DeviceState& state = *devices_[device_index];
+        DeviceGuard guard(state.device_id);
+        cudaStreamDestroy(upload_streams[device_index]);
+      }
       throw;
     }
 
-    check_cuda_device(cudaFree(d_upload), "cudaFree float16 upload staging", device_id);
-    check_cuda_device(cudaStreamDestroy(stream), "cudaStreamDestroy float16 upload", device_id);
+    for (size_t device_index = 0; device_index < devices_.size(); ++device_index) {
+      if (upload_streams[device_index] == nullptr) continue;
+      DeviceState& state = *devices_[device_index];
+      DeviceGuard guard(state.device_id);
+      check_cuda_device(
+        cudaStreamDestroy(upload_streams[device_index]),
+        "cudaStreamDestroy dataset upload",
+        state.device_id);
+    }
   }
 
   void allocate_slots(DeviceState& state)
@@ -1775,7 +1898,8 @@ private:
   int64_t batch_size_ = 0;
   RequestedStorageMode requested_storage_mode_ = RequestedStorageMode::Float16Resident;
   ActiveDatasetMode active_dataset_mode_ = ActiveDatasetMode::ResidentFloat16;
-  const float* host_dataset_ptr_ = nullptr;
+  const float* pinned_float_dataset_ = nullptr;
+  const __half* pinned_half_dataset_ = nullptr;
   std::vector<int> device_ids_;
   std::vector<int64_t> dataset_ids_;
   std::vector<std::unique_ptr<DeviceState>> devices_;
@@ -1884,12 +2008,8 @@ struct SearchRunner {
 };
 
 struct TimingSummary {
-  int runs = 0;
-  double min_sec = 0.0;
-  double mean_sec = 0.0;
   double median_sec = 0.0;
   double p95_sec = 0.0;
-  std::vector<double> all_sec;
 };
 
 TimingSummary summarize_times(std::vector<double> times)
@@ -1898,14 +2018,10 @@ TimingSummary summarize_times(std::vector<double> times)
   std::sort(sorted.begin(), sorted.end());
 
   TimingSummary s;
-  s.runs = static_cast<int>(times.size());
-  s.min_sec = sorted.front();
-  s.mean_sec = std::accumulate(times.begin(), times.end(), 0.0) / times.size();
   s.median_sec = sorted[sorted.size() / 2];
   const size_t p95_index =
     std::min(sorted.size() - 1, static_cast<size_t>(0.95 * static_cast<double>(sorted.size() - 1)));
   s.p95_sec = sorted[p95_index];
-  s.all_sec = std::move(times);
   return s;
 }
 
@@ -2074,31 +2190,51 @@ std::unique_ptr<MultiGpuExactReranker> create_cagra_exact_reranker(
   const LoadedData& data,
   int candidate_k,
   int batch_size,
+  const float* pinned_float_dataset,
+  const __half* pinned_half_dataset,
   const std::optional<std::vector<int>>& device_ids,
   const std::string& requested_storage_dtype,
   std::string* active_storage_dtype)
 {
   auto reranker = std::make_unique<MultiGpuExactReranker>(
-    data, K, candidate_k, batch_size, device_ids, requested_storage_dtype);
+    data,
+    K,
+    candidate_k,
+    batch_size,
+    pinned_float_dataset,
+    pinned_half_dataset,
+    device_ids,
+    requested_storage_dtype);
   if (active_storage_dtype != nullptr) *active_storage_dtype = requested_storage_dtype;
   return reranker;
 }
 
 template <typename T>
-void run_cagra_configs_typed(
-  const std::vector<CagraConfig>& configs,
+void run_cagra_optimized_typed(
+  const CagraConfig& config,
   const fs::path& output_path)
 {
   LoadedData data = load_default_data_from_npy_cache();
   GroundTruth ground_truth = load_required_ground_truth();
 
-  const std::vector<T> index_dataset = convert_float_dataset<T>(data.dataset);
+  PinnedHostBuffer<T> index_dataset = convert_float_dataset_pinned<T>(data.dataset);
   const std::vector<T> search_queries = convert_float_dataset<T>(data.queries);
+
+  const float* pinned_float_dataset = nullptr;
+  const __half* pinned_half_dataset = nullptr;
+  if constexpr (std::is_same_v<T, float>) {
+    pinned_float_dataset = index_dataset.data();
+  } else {
+    pinned_half_dataset = index_dataset.data();
+  }
 
   const auto device_ids = optional_int_list_from_env("CUVS_BENCH_CAGRA_DEVICE_IDS");
   auto rerank_device_ids = optional_int_list_from_env("CUVS_BENCH_CAGRA_RERANK_DEVICE_IDS");
   if (!rerank_device_ids.has_value()) rerank_device_ids = device_ids;
   MultiGpuResources resources(device_ids);
+
+  const bool exact_rerank = exact_rerank_enabled(config);
+  const int search_k = get_search_k(config);
 
   const int64_t offline_rows = std::min<int64_t>(OFFLINE_QUERY_COUNT, data.n_queries);
   const int64_t online_rows = std::min<int64_t>(ONLINE_QUERY_COUNT, data.n_queries);
@@ -2130,8 +2266,9 @@ void run_cagra_configs_typed(
     std::cout << "device ids: all visible\n";
   }
 
-  const std::string rerank_backend = getenv_or("CUVS_BENCH_CAGRA_RERANK_BACKEND", "multi_gpu");
-  if (rerank_backend != "multi_gpu") {
+  const std::string rerank_backend =
+    exact_rerank ? getenv_or("CUVS_BENCH_CAGRA_RERANK_BACKEND", "multi_gpu") : "none";
+  if (exact_rerank && rerank_backend != "multi_gpu") {
     throw std::runtime_error(
       "CUVS_BENCH_CAGRA_RERANK_BACKEND must be 'multi_gpu'. "
       "Only multi-GPU exact rerank is supported by this runner.");
@@ -2140,191 +2277,168 @@ void run_cagra_configs_typed(
   const std::string requested_rerank_storage_dtype =
     getenv_or("CUVS_BENCH_CAGRA_RERANK_STORAGE_DTYPE", "float16");
 
-  std::cout << "exact rerank default: "
-            << (getenv_or("CUVS_BENCH_CAGRA_ENABLE_EXACT_RERANK", "1") != "0") << "\n";
+  std::cout << "exact rerank: " << (exact_rerank ? "enabled" : "disabled") << "\n";
   std::cout << "rerank backend: " << rerank_backend << "\n";
-  std::cout << "rerank storage dtype: " << requested_rerank_storage_dtype << "\n";
-  std::cout << "rerank batch size: " << rerank_batch_size << "\n";
-  if (rerank_device_ids.has_value()) {
-    std::cout << "rerank device ids:";
-    for (int id : *rerank_device_ids) std::cout << ' ' << id;
-    std::cout << "\n";
-  } else {
-    std::cout << "rerank device ids: all visible\n";
+  if (exact_rerank) {
+    std::cout << "rerank storage dtype: " << requested_rerank_storage_dtype << "\n";
+    std::cout << "rerank batch size: " << rerank_batch_size << "\n";
+    if (rerank_device_ids.has_value()) {
+      std::cout << "rerank device ids:";
+      for (int id : *rerank_device_ids) std::cout << ' ' << id;
+      std::cout << "\n";
+    } else {
+      std::cout << "rerank device ids: all visible\n";
+    }
   }
   std::cout << "pinned host search I/O: enabled\n";
 
-  std::map<BuildKey, std::vector<CagraConfig>> grouped;
-  for (const CagraConfig& c : configs) grouped[build_key_from_config(c)].push_back(c);
-
   std::vector<ResultRow> results;
-  int config_number = 0;
-  const int total_configs = static_cast<int>(configs.size());
 
-  for (const auto& [key, search_configs] : grouped) {
-    CagraConfig build_config = search_configs.front();
-    std::unique_ptr<MultiGpuExactReranker> reranker;
-    int reranker_candidate_k = -1;
-    std::string reranker_storage_dtype = "none";
+  std::cout << "\nBuilding CAGRA index with "
+            << "graph_degree=" << config.graph_degree << ", "
+            << "intermediate_graph_degree=" << config.intermediate_graph_degree << ", "
+            << "build_algo=" << config.build_algo << "...\n";
 
-    std::cout << "\nBuilding CAGRA index with "
-              << "graph_degree=" << build_config.graph_degree << ", "
-              << "intermediate_graph_degree=" << build_config.intermediate_graph_degree << ", "
-              << "build_algo=" << build_config.build_algo << "...\n";
+  IndexParamsOwner index_params(config);
+  MultiGpuCagraIndex index;
 
-    IndexParamsOwner index_params(build_config);
-    MultiGpuCagraIndex index;
+  DlpackMatrix dataset_tensor(
+    const_cast<T*>(index_dataset.data()), data.n_rows, data.dim, dtype_for_dlpack<T>());
 
-    DlpackMatrix dataset_tensor(
-      const_cast<T*>(index_dataset.data()), data.n_rows, data.dim, dtype_for_dlpack<T>());
+  resources.sync();
+  auto build_start = std::chrono::steady_clock::now();
 
-    resources.sync();
-    auto build_start = std::chrono::steady_clock::now();
+  check_cuvs(cuvsMultiGpuCagraBuild(resources.handle,
+                                    index_params.mg,
+                                    dataset_tensor.get(),
+                                    index.index),
+             "cuvsMultiGpuCagraBuild");
 
-    check_cuvs(cuvsMultiGpuCagraBuild(resources.handle,
-                                      index_params.mg,
-                                      dataset_tensor.get(),
-                                      index.index),
-               "cuvsMultiGpuCagraBuild");
+  resources.sync();
+  auto build_end = std::chrono::steady_clock::now();
+  const double build_time = std::chrono::duration<double>(build_end - build_start).count();
 
-    resources.sync();
-    auto build_end = std::chrono::steady_clock::now();
-    const double build_time = std::chrono::duration<double>(build_end - build_start).count();
+  std::cout << "CAGRA index built in " << std::fixed << std::setprecision(2)
+            << build_time << " seconds\n";
 
-    std::cout << "CAGRA index built in " << std::fixed << std::setprecision(2)
-              << build_time << " seconds\n";
+  std::unique_ptr<MultiGpuExactReranker> reranker;
+  std::string reranker_storage_dtype = "none";
 
-    for (const CagraConfig& config : search_configs) {
-      config_number += 1;
-      const bool exact_rerank = exact_rerank_enabled(config);
-      const int search_k = get_search_k(config);
+  std::cout << "\nitopk_size=" << config.itopk_size << ", "
+            << "search_k=" << search_k << ", "
+            << "search_width=" << config.search_width << ", "
+            << "max_iterations=" << config.max_iterations << "\n";
 
-      std::cout << "\n[" << config_number << "/" << total_configs << "] "
-                << "itopk_size=" << config.itopk_size << ", "
-                << "search_k=" << search_k << ", "
-                << "search_width=" << config.search_width << ", "
-                << "max_iterations=" << config.max_iterations << "\n";
-
-      if (exact_rerank) {
-        if (reranker_candidate_k != search_k) {
-          resources.sync();
-          reranker.reset();
-          resources.sync();
-
-          std::cout << "Creating exact CAGRA reranker "
-                    << "(candidate_k=" << search_k
-                    << ", storage=" << requested_rerank_storage_dtype << ")...\n";
-          reranker = create_cagra_exact_reranker(
-            data,
-            search_k,
-            rerank_batch_size,
-            rerank_device_ids,
-            requested_rerank_storage_dtype,
-            &reranker_storage_dtype);
-          reranker_candidate_k = search_k;
-          std::cout << "Exact reranker mode: " << reranker->mode()
-                    << " (storage=" << reranker_storage_dtype << ")\n";
-        }
-      }
-
-      SearchParamsOwner search_params(config);
-
-      MatrixViewHost<const T> offline_query_view{
-        benchmark_queries.data(), offline_rows, data.dim};
-      MatrixViewHost<const T> online_query_view{
-        online_queries.data(), online_rows, data.dim};
-      MatrixViewHost<const float> offline_rerank_query_view{
-        benchmark_rerank_queries.data(), offline_rows, data.dim};
-      MatrixViewHost<const float> online_rerank_query_view{
-        online_rerank_queries.data(), online_rows, data.dim};
-
-      SearchRunner<T> offline_search(
-        resources,
-        index.index,
-        search_params,
-        offline_query_view,
-        offline_rerank_query_view,
-        data,
-        K,
-        search_k,
-        exact_rerank,
-        reranker.get());
-
-      SearchRunner<T> online_search(
-        resources,
-        index.index,
-        search_params,
-        online_query_view,
-        online_rerank_query_view,
-        data,
-        K,
-        search_k,
-        exact_rerank,
-        reranker.get());
-
-      TimingSummary offline_summary = measure_synchronized_wall_time(
-        [&]() { offline_search.run(); },
-        SEARCH_WARMUP_RUNS,
-        SEARCH_TIMED_RUNS,
-        resources);
-
-      const SearchOutput offline_output = offline_search.last_output;
-      const double search_time = offline_summary.median_sec;
-
-      TimingSummary online_summary = measure_synchronized_wall_time(
-        [&]() { online_search.run(); },
-        SEARCH_WARMUP_RUNS,
-        SEARCH_TIMED_RUNS,
-        resources);
-
-      const double queries_per_second = static_cast<double>(offline_rows) / search_time;
-      const double latency_per_query = search_time * MS_PER_SECOND / static_cast<double>(offline_rows);
-
-      RecallResult recall = calculate_recall_at_k(offline_output, ground_truth, K);
-
-      std::cout << "First query top neighbors:";
-      for (int i = 0; i < DISPLAY_TOP_K; ++i) {
-        std::cout << ' ' << offline_output.neighbors[static_cast<size_t>(i)];
-      }
-      std::cout << "\n";
-
-      std::cout << "First query top distances:";
-      for (int i = 0; i < DISPLAY_TOP_K; ++i) {
-        std::cout << ' ' << offline_output.distances[static_cast<size_t>(i)];
-      }
-      std::cout << "\n";
-
-      std::cout << std::fixed << std::setprecision(4);
-      std::cout << "Offline median: " << search_time << " seconds\n";
-      std::cout << "Throughput: " << std::setprecision(2) << queries_per_second
-                << " queries/second\n";
-      std::cout << "Latency per query: " << std::setprecision(4)
-                << latency_per_query << " ms\n";
-      std::cout << "Recall@10: " << recall.recall << " ("
-                << recall.total_correct << "/" << recall.total_possible << ")\n";
-
-      ResultRow row;
-      row.config = config;
-      row.search_k = search_k;
-      row.exact_rerank = exact_rerank;
-      row.rerank_backend = exact_rerank ? rerank_backend : "none";
-      row.rerank_storage_dtype = exact_rerank ? reranker_storage_dtype : "none";
-      row.build_time = build_time;
-      row.search_time = search_time;
-      row.online_summary = online_summary;
-      row.queries_per_second = queries_per_second;
-      row.latency_per_query = latency_per_query;
-      row.recall_at_10 = recall.recall;
-      row.total_correct = recall.total_correct;
-      row.total_possible = recall.total_possible;
-      results.push_back(std::move(row));
-
-      resources.sync();
-    }
-
-    resources.sync();
+  if (exact_rerank) {
+    std::cout << "Creating exact CAGRA reranker "
+              << "(candidate_k=" << search_k
+              << ", storage=" << requested_rerank_storage_dtype << ")...\n";
+    reranker = create_cagra_exact_reranker(
+      data,
+      search_k,
+      rerank_batch_size,
+      pinned_float_dataset,
+      pinned_half_dataset,
+      rerank_device_ids,
+      requested_rerank_storage_dtype,
+      &reranker_storage_dtype);
+    std::cout << "Exact reranker mode: " << reranker->mode()
+              << " (storage=" << reranker_storage_dtype << ")\n";
   }
 
+  SearchParamsOwner search_params(config);
+
+  MatrixViewHost<const T> offline_query_view{
+    benchmark_queries.data(), offline_rows, data.dim};
+  MatrixViewHost<const T> online_query_view{
+    online_queries.data(), online_rows, data.dim};
+  MatrixViewHost<const float> offline_rerank_query_view{
+    benchmark_rerank_queries.data(), offline_rows, data.dim};
+  MatrixViewHost<const float> online_rerank_query_view{
+    online_rerank_queries.data(), online_rows, data.dim};
+
+  SearchRunner<T> offline_search(
+    resources,
+    index.index,
+    search_params,
+    offline_query_view,
+    offline_rerank_query_view,
+    data,
+    K,
+    search_k,
+    exact_rerank,
+    reranker.get());
+
+  SearchRunner<T> online_search(
+    resources,
+    index.index,
+    search_params,
+    online_query_view,
+    online_rerank_query_view,
+    data,
+    K,
+    search_k,
+    exact_rerank,
+    reranker.get());
+
+  TimingSummary offline_summary = measure_synchronized_wall_time(
+    [&]() { offline_search.run(); },
+    SEARCH_WARMUP_RUNS,
+    SEARCH_TIMED_RUNS,
+    resources);
+
+  const SearchOutput offline_output = offline_search.last_output;
+  const double search_time = offline_summary.median_sec;
+
+  TimingSummary online_summary = measure_synchronized_wall_time(
+    [&]() { online_search.run(); },
+    SEARCH_WARMUP_RUNS,
+    SEARCH_TIMED_RUNS,
+    resources);
+
+  const double queries_per_second = static_cast<double>(offline_rows) / search_time;
+  const double latency_per_query = search_time * MS_PER_SECOND / static_cast<double>(offline_rows);
+
+  RecallResult recall = calculate_recall_at_k(offline_output, ground_truth, K);
+
+  std::cout << "First query top neighbors:";
+  for (int i = 0; i < DISPLAY_TOP_K; ++i) {
+    std::cout << ' ' << offline_output.neighbors[static_cast<size_t>(i)];
+  }
+  std::cout << "\n";
+
+  std::cout << "First query top distances:";
+  for (int i = 0; i < DISPLAY_TOP_K; ++i) {
+    std::cout << ' ' << offline_output.distances[static_cast<size_t>(i)];
+  }
+  std::cout << "\n";
+
+  std::cout << std::fixed << std::setprecision(4);
+  std::cout << "Offline median: " << search_time << " seconds\n";
+  std::cout << "Throughput: " << std::setprecision(2) << queries_per_second
+            << " queries/second\n";
+  std::cout << "Latency per query: " << std::setprecision(4)
+            << latency_per_query << " ms\n";
+  std::cout << "Recall@10: " << recall.recall << " ("
+            << recall.total_correct << "/" << recall.total_possible << ")\n";
+
+  ResultRow row;
+  row.config = config;
+  row.search_k = search_k;
+  row.exact_rerank = exact_rerank;
+  row.rerank_backend = exact_rerank ? rerank_backend : "none";
+  row.rerank_storage_dtype = exact_rerank ? reranker_storage_dtype : "none";
+  row.build_time = build_time;
+  row.search_time = search_time;
+  row.online_summary = online_summary;
+  row.queries_per_second = queries_per_second;
+  row.latency_per_query = latency_per_query;
+  row.recall_at_10 = recall.recall;
+  row.total_correct = recall.total_correct;
+  row.total_possible = recall.total_possible;
+  results.push_back(std::move(row));
+
+  resources.sync();
   write_results_csv(results, output_path);
   std::cout << "\nSaved CAGRA results to: " << output_path << "\n";
 }
@@ -2345,13 +2459,12 @@ int main()
         "The Python binding may dispatch more flexibly.");
     }
 
-    std::vector<CagraConfig> configs = {optimized};
     fs::path output_path = project_root() / "results" / "cagra_optimized_results.csv";
 
     if (dataset_dtype == "float16") {
-      run_cagra_configs_typed<__half>(configs, output_path);
+      run_cagra_optimized_typed<__half>(optimized, output_path);
     } else if (dataset_dtype == "float32") {
-      run_cagra_configs_typed<float>(configs, output_path);
+      run_cagra_optimized_typed<float>(optimized, output_path);
     } else {
       throw std::runtime_error("Only float16 and float32 are implemented in this C++ translation");
     }
